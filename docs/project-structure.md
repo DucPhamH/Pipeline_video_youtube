@@ -10,7 +10,7 @@ Crawl/
 ├── docs/                          Tài liệu thiết kế + tài liệu này
 │   ├── crawl-overview.md           **Đọc nhanh cho AI** — vấn đề + đã ship
 │   ├── crawl-service.md            Nghiệp vụ + kiến trúc Crawl (chi tiết)
-│   ├── translate-service.md        Thiết kế chức năng Translate (chưa code)
+│   ├── translate-service.md        Chức năng Translate (đã code — xem translate-service/)
 │   ├── platform-and-licensing.md   Quy ước chung (DB, bán tool, chi phí)
 │   ├── project-structure.md        (file này)
 │   ├── database-schema.md
@@ -21,10 +21,9 @@ Crawl/
 │
 ├── frontend/                      React 19 + TS + Vite + Tailwind v4 +
 │   │                               shadcn/ui (@base-ui/react) + TanStack
-│   │                               Query — SPA gọi thẳng REST API crawl-service.
-│   │                               KHÔNG có tài liệu thiết kế riêng — code tự
-│   │                               giải thích qua comment; xem `src/features/
-│   │                               crawl/` cho toàn bộ UI của service này.
+│   │                               Query — SPA gọi crawl-service và
+│   │                               translate-service. Xem `src/features/crawl/`
+│   │                               và `src/features/translate/`.
 │   └── src/
 │       ├── api/                    client.ts (fetch wrapper), types.ts (khớp
 │       │                           tay theo schemas.py — KHÔNG có codegen,
@@ -33,11 +32,13 @@ Crawl/
 │       │                           NovelDetailPage, SettingsPage,
 │       │                           DevToolsPage — chỉ route ở bản DEV),
 │       │                           components/, api.ts, sessionGuides.ts
+│       ├── features/translate/     Thư viện Work, modal bắt đầu dịch,
+│       │                           Job Detail, registry AI — route /translate
 │       ├── components/ui/          shadcn/ui primitives (Select, Dialog...)
 │       ├── layout/, lib/, hooks/
 │       └── App.tsx, main.tsx
 │
-└── crawl-service/
+├── crawl-service/
     ├── .venv/                      Virtualenv (KHÔNG commit — chạy
     │                               `python3 -m venv .venv` để tạo lại)
     ├── requirements.txt
@@ -149,6 +150,17 @@ Crawl/
                 ├── schemas.py          Pydantic request/response
                 └── routers.py          Endpoint, gọi use case (xem
                                         api-reference.md)
+
+└── translate-service/             ĐÃ CODE — DB riêng, không đọc SQLite crawl
+    ├── Dockerfile, requirements.txt, .env.example
+    └── src/
+        ├── main.py                uvicorn, prefix /api/translate
+        ├── platform_/             config, db, settings KV (bản riêng)
+        └── translate/
+            ├── domain/            Work, Variant, Job, Segment, Glossary
+            ├── application/       import TXT, from-crawl, run_job, export
+            ├── infrastructure/    SQLite, parser TXT, OpenAI-compatible
+            └── api/               routers + schemas
 ```
 
 ## 2. Quy ước đặt tên cần nhớ
@@ -165,11 +177,9 @@ Crawl/
   `SourceConfig`, không cần code logic mới; site khác họ hẳn: override
   method cần thiết, vẫn implement đúng `SourcePort` (Protocol, không bắt
   buộc kế thừa `BaseHtmlSource`). Xem `crawl-service.md` mục 4b.
-- Mỗi service mới (`translate-service`, `tts-service`, `video-service` —
-  làm sau) là **1 thư mục riêng ở gốc repo** (ngang hàng `crawl-service/`,
-  `frontend/`), KHÔNG phải thư mục con bên trong `crawl-service/` — mỗi
-  service tự deploy độc lập (microservice thật). Bên trong mỗi service vẫn
-  tổ chức cùng 4 tầng `domain/application/infrastructure/api` như `crawl/`.
+- `translate-service/` đã là thư mục riêng ở gốc repo, ngang hàng
+  `crawl-service/` và `frontend/`. `tts-service` / `video-service` chưa có.
+  Bên trong mỗi service vẫn 4 tầng `domain/application/infrastructure/api`.
   Xem [docs/microservices-architecture.md](./microservices-architecture.md).
 
 ## 3. Cách chạy local
@@ -183,9 +193,23 @@ python3 -m venv .venv
 # VIP Qidian (tuỳ chọn): cài Node.js 18+ — xem tools/qidian_decrypt/README.md
 
 cd src
-PYTHONPATH=. ../.venv/bin/uvicorn main:app --reload --port 8000
-# Mở http://localhost:8000/docs (Swagger UI — gọi thử API trực tiếp)
+PYTHONPATH=. ../.venv/bin/uvicorn main:app --reload --port 8090
+# Mở http://localhost:8090/docs (Swagger UI — gọi thử API trực tiếp)
 ```
+
+Cùng lệnh từ gốc repo: `make api-dev`.
+
+**Translate — venv riêng (dev):**
+```bash
+cd translate-service
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+cp .env.example .env
+PYTHONPATH=src .venv/bin/uvicorn main:app --reload --host 127.0.0.1 --port 8010
+# http://localhost:8010/docs
+```
+
+Từ gốc repo, sau khi đã có `.venv`: `make translate-dev`.
 
 **Frontend — dev server:**
 ```bash
@@ -199,11 +223,13 @@ npm run lint          # oxlint
 **Docker (giống môi trường sẽ chạy thật khi bán/self-host):**
 ```bash
 docker compose up --build
-# Mở http://localhost:8090/docs  (cổng 8090, đổi bằng biến CRAWL_SERVICE_PORT
-# nếu 8090 đã bị chiếm — xem docker-compose.yml ở gốc repo)
+# UI:  http://localhost:5173
+# Crawl OpenAPI: http://localhost:8090/docs
+# Translate OpenAPI: http://localhost:8010/docs
 ```
-Dữ liệu (`data/db.sqlite3`, `data/raw/`, `data/cleaned/`) lưu trong Docker
-volume `crawl_data`, giữ nguyên qua các lần `docker compose down/up`.
+Compose chạy `crawl-service`, `translate-service`, và `frontend` (nginx
+proxy `/api/` và `/api/translate/`). Dữ liệu crawl nằm trong volume
+`crawl_data`, dữ liệu dịch trong `translate_data`.
 
 Lúc khởi động, `main.py` tự động:
 1. `init_db()` — tạo bảng nếu chưa có (KHÔNG có migration tool — xem mục 6).
@@ -261,9 +287,8 @@ trước khi kết luận có bug thật.
 
 ## 5. Docker
 
-`Dockerfile` + `.dockerignore` trong `crawl-service/`, orchestrate bằng
-`docker-compose.yml` ở gốc repo — xem mục 3 cách chạy. Thiết kế sẵn để
-thêm service mới (Translate/TTS/Video) là thêm 1 block trong compose, xem
+`docker-compose.yml` ở gốc repo chạy crawl, translate, và frontend. TTS và
+video chưa có block. Xem
 [docs/microservices-architecture.md](./microservices-architecture.md).
 
 ## 6. Ghi chú quan trọng — CHƯA có (việc cần làm sau)
@@ -273,5 +298,4 @@ thêm service mới (Translate/TTS/Video) là thêm 1 block trong compose, xem
   đã tồn tại khi đổi schema. Đổi cột/bảng hiện tại phải tự xoá
   `data/db.sqlite3` (mất dữ liệu) hoặc tự viết script ALTER — cần bổ sung
   Alembic trước khi có dữ liệu thật đáng giữ.
-- **Chưa có CI** (GitHub Actions chạy test tự động mỗi lần đổi code) — hợp
-  lý để thêm khi có git repo thật (hiện repo chưa init git).
+- **Chưa có CI** (GitHub Actions chạy test tự động mỗi lần đổi code).

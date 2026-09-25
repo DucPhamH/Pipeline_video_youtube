@@ -12,18 +12,13 @@ lỗi thời, sửa lại theo tài liệu này).
 
 ```
 Crawl/                          (repo gốc, monorepo chứa nhiều service)
-├── docker-compose.yml           chạy TẤT CẢ service cùng lúc (dev local)
+├── docker-compose.yml           crawl + translate + frontend
 ├── docs/
-├── crawl-service/                ĐÃ CODE — **đọc nhanh:** [crawl-overview.md](./crawl-overview.md)
-│   ├── Dockerfile                  chi tiết: crawl-service.md · project-structure.md
-│   ├── requirements.txt
-│   ├── .env
-│   └── src/{platform_, crawl}/...
-├── translate-service/            (chưa code) — **thiết kế chức năng:**
-│   └── …                         [docs/translate-service.md](./translate-service.md)
-├── tts-service/                  (chưa code)
-├── video-service/                (chưa code)
-└── frontend/                     (chưa code) React, gọi API các service trên
+├── crawl-service/                ĐÃ CODE — [crawl-overview.md](./crawl-overview.md)
+├── translate-service/            ĐÃ CODE — [translate-service.md](./translate-service.md)
+├── frontend/                     ĐÃ CODE — Sites, novel, /translate
+├── tts-service/                  chưa có
+└── video-service/                chưa có
 ```
 
 **Mỗi service tự có 1 bản `platform_/` riêng** (config, db, settings_store,
@@ -39,42 +34,28 @@ lập, không phụ thuộc nhau về mặt code.
 đọc — vì vậy sau này đổi schema/đổi DB engine của Crawl sẽ không làm gãy
 Translate.
 
-Muốn biết truyện nào đã crawl xong, Translate service gọi **API thật** của
-Crawl service:
+Crawl giao chương bằng HTTP (`POST /works/from-crawl`), không bằng cách
+đọc file DB. Trong Compose, hostname là `crawl-service` / `translate-service`
+(DNS nội bộ), không phải `localhost`.
 
-```
-GET http://crawl-service:8000/api/crawl/novels?status=fully_crawled
-```
+Translate lưu Work, Variant, Job, Segment trong DB của nó. Tham chiếu crawl
+là `external_id` dạng `crawl:novel:{id}` — không có foreign key xuyên DB.
 
-(`crawl-service` ở đây là tên service trong `docker-compose.yml`, Docker tự
-phân giải thành IP nội bộ — không phải `localhost`.)
+## 3. Cách các service gọi nhau — HTTP khi user bấm, không message queue
 
-Translate service lưu kết quả dịch vào **DB CỦA RIÊNG NÓ** (bảng
-`translated_chapters` chẳng hạn), chỉ giữ lại `chapter_id` (giá trị số, lấy
-từ response API của Crawl) để tham chiếu — KHÔNG tạo foreign key thật giữa
-2 DB khác nhau (không thể, và cũng không nên, vì đó là khác database).
+Quy mô self-host, một người dùng: không Kafka/RabbitMQ.
 
-## 3. Cách các service gọi nhau — polling qua HTTP, không cần message queue
+Crawl tự quét web và không phụ thuộc service khác. Lịch daily
+(APScheduler) chỉ thuộc crawl.
 
-Vì quy mô hiện tại (self-host, 1 người dùng), **không cần** Kafka/RabbitMQ —
-thêm vào chỉ tốn hạ tầng, đi ngược tinh thần "càng free càng tốt". Thay vào
-đó, mỗi service tự có `scheduler.py` riêng (đã có ở Crawl, dùng
-APScheduler), lịch trình định kỳ **tự đi hỏi** service phía trước:
+Translate **không** tự poll danh sách truyện. User bấm **Gửi sang dịch**
+trên novel: crawl gọi `POST /api/translate/works/from-crawl` (mặc định
+không start job). Translate lưu Work trong DB của nó. Job chạy xong thì
+gọi ngược `POST /api/crawl/novels/{id}/translate-lifecycle`
+(`translating` / `ready_for_video` / `failed`).
 
-```
-Crawl service:      tự crawl web (đã code) — không phụ thuộc service nào khác
-Translate service:  APScheduler mỗi X phút -> gọi API Crawl (mục 2) lấy
-                     danh sách chương "fully_crawled" chưa dịch -> dịch ->
-                     lưu vào DB riêng -> (tương lai) gọi ngược 1 API của
-                     Crawl để đánh dấu đã dịch xong, hoặc tự theo dõi bằng
-                     bảng riêng của mình.
-TTS service:         tương tự, hỏi Translate service.
-Video service:       tương tự, hỏi TTS service.
-```
-
-Đây chính là mô hình **pipeline kéo (pull-based)** — mỗi service tự chủ
-động lấy việc, không ai đẩy việc cho ai. Đơn giản, không cần hạ tầng thêm,
-dễ debug (gọi thử bằng `curl`/Swagger UI là thấy ngay dữ liệu thật).
+TTS và video chưa có. Khi có, chúng đọc file export của translate, không
+mở DB của service trước.
 
 ## 4. Vì sao Crawl service ĐÃ SẴN SÀNG cho microservices mà không cần sửa
 
@@ -93,24 +74,14 @@ tạo thư mục mới cùng khuôn và để chúng gọi API của nhau.
 
 ## 5. `docker-compose.yml` — chạy nhiều service cùng lúc
 
-Xem file `docker-compose.yml` ở gốc repo — mỗi service 1 block, ví dụ thêm
-Translate service (khi code xong) chỉ cần:
+File ở gốc repo đã có ba service: `crawl-service` (host `8090`),
+`translate-service` (host `8010`, `CRAWL_SERVICE_URL=http://crawl-service:8000`),
+và `frontend` (nginx, host `5173`). Thêm TTS/video sau này là thêm một
+block, không sửa DB của service đã có.
 
-```yaml
-translate-service:
-  build: ./translate-service
-  ports: ["8001:8000"]
-  env_file: ["./translate-service/.env"]
-  environment:
-    CRAWL_SERVICE_URL: http://crawl-service:8000
-  depends_on: [crawl-service]
-```
+## 6. Việc chưa làm
 
-Không đụng vào block `crawl-service` đã có.
-
-## 6. Việc CHƯA làm (thành thật, tránh ảo tưởng đã xong)
-
-- Chưa có `tts-service`/`video-service`.
-- `translate-service/` **đã code Phase 0–2** (import TXT, mock/OpenAI, glossary/review/budget, from-crawl, callback lifecycle, FE `/translate`).
-- Crawl đã có `GET .../translate-handoff`, `POST .../send-to-translate`, `POST .../translate-lifecycle`.
-- Translate callback lifecycle `translating` / `ready_for_video` / `failed` khi job chạy xong.
+- Chưa có `tts-service` / `video-service`.
+- Translate chưa import EPUB (P5 trong spec). Polish/QA opt-in chưa làm.
+- Đã có: handoff crawl, callback lifecycle, registry nhiều AI, pool/fallback,
+  glossary, review, export TXT/JSON, UI `/translate`.

@@ -7,9 +7,10 @@
 > API: [api-reference.md](./api-reference.md).  
 > Service kế tiếp (dịch): [translate-service.md](./translate-service.md).
 >
-> **Phạm vi:** CHỈ `crawl-service` + FE crawl. Không implement dịch/TTS/video ở đây.
+> **Phạm vi:** CHỈ `crawl-service` + FE crawl. Dịch nằm ở `translate-service`
+> (đã code). TTS/video không có trong repo.
 
-**Trạng thái:** đã ship (code trong `crawl-service/` + `frontend/`). Cập nhật: 2026-09-18.
+**Trạng thái:** crawl đã ship. Handoff sang translate đã nối. Cập nhật: 2026-09-25.
 
 ---
 
@@ -26,7 +27,7 @@ Sites → Site (Quét | URL | Thư viện) → Novel (pipeline CTA)
          ↓
    raw + cleaned files + SQLite
          ↓
-   Export ZIP/TXT/EPUB/XLSX  ·  (sau) handoff → translate-service
+   Export ZIP/TXT/EPUB/XLSX  ·  Gửi sang dịch → translate-service
 ```
 
 ---
@@ -56,8 +57,9 @@ nhét LLM vào đây).
 3. **Genre UI:** 1 select **phẳng** / site (không tách “thể loại / ranking”).
 4. **DB riêng** service; translate **không** đọc SQLite crawl — chỉ API/handoff.
 5. **Raw vs cleaned:** 2 file song song; smooth không đè raw.
-6. **Lifecycle translate/video** trên Novel là **gợi ý pipeline** (enum có sẵn);
-   bước dịch thật nằm ở `translate-service` (chưa/đang thiết kế riêng).
+6. **Lifecycle translate/video** trên Novel là **gợi ý pipeline**. Bản dịch
+   nằm ở `translate-service`. Crawl chỉ nhận callback
+   `translating` / `ready_for_video` / `failed`.
 7. **FE** gọi REST crawl trực tiếp; i18n vi/en/zh.
 
 ---
@@ -79,8 +81,9 @@ discovered → crawling → fully_crawled
 rejected (không khớp filter quét)
 ```
 
-Enum còn: `translating` | `ready_for_video` | `produced` — **dành pipeline sau**;
-FE đã ẩn filter các trạng thái chưa ship.
+Enum còn: `translating` | `ready_for_video` (callback từ translate, hiện trên
+novel) và `produced` (video, chưa có product). Bộ lọc thư viện site không
+hiện ba trạng thái này.
 
 ### Chapter status
 
@@ -147,7 +150,7 @@ Genre active + settings (scan_window, max_chapters, narration, completion…)
 fully_crawled
   → Smooth (cleaned/)
   → Review (reviewed=true)
-  → Export  và/hoặc  (sau) POST handoff → translate-service
+  → Export  và/hoặc  Gửi sang dịch (handoff, job chưa chạy cho đến khi chọn AI)
 ```
 
 ### 5c. Import tay
@@ -205,8 +208,9 @@ Global: webhook daily summary.
 | `external_id = crawl:novel:{id}` | Work riêng, DB riêng |
 | Callback URL (opt) | Cập nhật gợi ý lifecycle trên FE crawl |
 
-**Chưa bắt buộc đã code handoff** — khi làm translate P2 mới nối. Export file
-hiện là cầu tạm cho user mang sang tool dịch ngoài.
+Handoff đã nối: `GET .../translate-handoff`, `POST .../send-to-translate`,
+callback `POST .../translate-lifecycle`. FE gửi `start_job: false`. Export
+file vẫn dùng được nếu không sang translate.
 
 ---
 
@@ -218,6 +222,7 @@ hiện là cầu tạm cho user mang sang tool dịch ngoài.
 | `/sites/:key` | Quét / URL / Thư viện + session + settings |
 | `/novels/:id` | Pipeline CTA, smooth, review, export, bảng chương |
 | `/settings` | Webhook global (filter quét = per-site) |
+| `/translate` | Thư viện dịch — xem `translate-service.md` |
 | DevTools | Dry-run (DEV only) |
 
 ---
@@ -229,7 +234,7 @@ hiện là cầu tạm cho user mang sang tool dịch ngoài.
 - Site VIP phụ thuộc cookie user; không giải mã trái phép.  
 - Một số site registry chết / cần session — xem `SUPPORT_SITES.md`.  
 - SQLite: commit theo chương + WAL; tránh nhiều writer.  
-- Enum translating/video trên Novel = chỗ neo pipeline, chưa phải product dịch.
+- Enum `translating` / `ready_for_video` trên Novel là trạng thái callback từ translate, không phải bản dịch. `produced` (video) chưa có product.
 
 ---
 
@@ -256,7 +261,7 @@ PYTHONPATH=src .venv/bin/uvicorn main:app --reload --port 8090
 cd frontend && npm run dev   # thường :5173
 ```
 
-Docker: `docker compose up` ở root (API + FE nginx) — xem README.
+Docker: `docker compose up` ở root (crawl + translate + FE nginx) — xem README.
 
 ---
 

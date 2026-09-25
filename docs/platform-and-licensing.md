@@ -77,10 +77,8 @@ qua kênh YouTube. Vài điểm cần cân nhắc:
 | License check | File ký số offline | Free (không cần server) |
 | Dịch | Claude API (khách tự trả bằng key riêng) | **Duy nhất khoản bắt buộc trả phí**, nhưng người mua trả, không phải người bán |
 
-Thiết kế Translate service (doc riêng, làm sau) nên **để ngỏ chỗ cắm nhiều
-provider dịch** (Claude mặc định, nhưng cấu hình được sang OpenAI/model
-local qua Settings) — vừa linh hoạt cho khách muốn tối ưu chi phí, vừa là
-điểm bán thêm.
+Translate đã code và cắm nhiều provider OpenAI-compatible (kể cả model
+local), khách tự trả key. Xem `translate-service.md`.
 
 ## 5. Đóng gói để bán
 

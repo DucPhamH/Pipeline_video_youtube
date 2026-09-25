@@ -402,21 +402,22 @@ Crawl lifecycle gợi ý (không bắt translate phụ thuộc enum crawl): sau 
 
 ---
 
-## 14. Gợi ý cấu trúc thư mục (khi code)
+## 14. Cấu trúc thư mục (đã code)
+
+Job chạy trong thread của process API (`run_job`), không có worker queue riêng.
 
 ```
 translate-service/
   src/translate/
-    domain/          # Work, Variant, Job, Segment, Glossary
-    application/     # use cases: import, handoff, run_job, export, clone
-    infrastructure/  # db, providers, queue, parsers (epub/txt)
-    api/             # FastAPI routers
-  worker/            # job consumer
+    domain/
+    application/     # import, from-crawl, run_job, export, variants
+    infrastructure/  # sqlite, openai-compatible, parser txt
+    api/
   tests/
   README.md
 ```
 
-Stack gợi ý (chưa chốt cứng): FastAPI + SQLite/Postgres + queue (ARQ/RQ/Bull tùy FE stack) + OpenAI-compatible client — cùng tinh thần deploy độc lập như `crawl-service/`.
+Stack: FastAPI + SQLite + OpenAI-compatible client. Deploy độc lập như `crawl-service/`.
 
 ---
 
