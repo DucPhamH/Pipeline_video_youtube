@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Env & secrets
+.env
+!.env.example
+
+# Runtime data (mỗi service tự sinh, không commit)
+*/data/db.sqlite3
+*/data/db.sqlite3-*
+*/data/raw/
+*/data/cleaned/
+*/data/uploads/
+*/data/audio/
+*/data/video/
+
+# IDE
+.vscode/
+.idea/
+
+# Test/coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node (frontend, sau này)
+node_modules/
+dist/
