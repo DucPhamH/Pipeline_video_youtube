@@ -31,7 +31,19 @@ const Toaster = ({ ...props }: ToasterProps) => {
           "--normal-bg": "var(--popover)",
           "--normal-text": "var(--popover-foreground)",
           "--normal-border": "var(--border)",
-          "--border-radius": "var(--radius)",
+          "--border-radius": "12px",
+          "--success-bg": "var(--success-soft)",
+          "--success-text": "var(--success)",
+          "--success-border": "color-mix(in srgb, var(--success) 25%, transparent)",
+          "--error-bg": "var(--danger-soft)",
+          "--error-text": "var(--danger)",
+          "--error-border": "color-mix(in srgb, var(--danger) 25%, transparent)",
+          "--warning-bg": "var(--warning-soft)",
+          "--warning-text": "var(--warning)",
+          "--warning-border": "color-mix(in srgb, var(--warning) 25%, transparent)",
+          "--info-bg": "var(--info-soft)",
+          "--info-text": "var(--info)",
+          "--info-border": "color-mix(in srgb, var(--info) 25%, transparent)",
         } as React.CSSProperties
       }
       toastOptions={{

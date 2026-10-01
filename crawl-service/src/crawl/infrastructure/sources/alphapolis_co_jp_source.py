@@ -18,7 +18,7 @@ từng truyện tại trang chủ + trang xếp hạng — đây là link GET th
 import re
 
 from crawl.domain.ports import ScrapeError
-from crawl.domain.value_objects import ChapterRef, NovelRef
+from crawl.domain.value_objects import ChapterRef
 from crawl.infrastructure.sources.base_browser_source import BaseBrowserSource
 from crawl.infrastructure.sources.base_html_source import SourceConfig
 
@@ -81,7 +81,9 @@ class AlphapolisCoJpSource(BaseBrowserSource):
         soup = self._get_soup(novel_url)
         m = _NOVEL_HREF.search(novel_url)
         if not m:
-            raise ScrapeError(f"[{self.key}] URL mục lục không đúng định dạng /novel/{{a}}/{{n}}: {novel_url}")
+            raise ScrapeError(
+                f"[{self.key}] URL mục lục không đúng định dạng /novel/{{a}}/{{n}}: {novel_url}"
+            )
         author_id, novel_id = m.group(1), m.group(2)
 
         chapters: list[ChapterRef] = []

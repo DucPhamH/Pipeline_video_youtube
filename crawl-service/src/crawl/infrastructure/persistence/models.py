@@ -70,6 +70,9 @@ class ChapterModel(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     novel_id: Mapped[int] = mapped_column(ForeignKey("novels.id"))
     chapter_index: Mapped[int] = mapped_column(Integer)
+    # Vị trí trong mục lục site (sync gần nhất) — thứ tự đọc/xuất. NULL = dữ
+    # liệu cũ chưa sync lại -> fallback chapter_index.
+    toc_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
     title: Mapped[str] = mapped_column(String(255))
     source_url: Mapped[str] = mapped_column(String(500))
     raw_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
@@ -88,4 +91,39 @@ class ChapterModel(Base):
         UniqueConstraint("novel_id", "chapter_index", name="uq_chapter_index"),
         Index("ix_chapter_novel_id", "novel_id"),
         Index("ix_chapter_status", "status"),
+        Index("ix_chapter_novel_source_url", "novel_id", "source_url"),
+        Index("ix_chapter_novel_toc_order", "novel_id", "toc_order"),
     )
+
+
+class NovelFollowModel(Base):
+    """Truyện đang ra mà người dùng theo dõi: tick nền kiểm tra mục lục định kỳ."""
+
+    __tablename__ = "novel_follows"
+
+    novel_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    auto_translate: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_audio: Mapped[bool] = mapped_column(Boolean, default=False)
+    voice_preset: Mapped[str] = mapped_column(String(40), default="nam_ke")
+    translate_variant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tts_work_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_checked_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    last_new_chapters: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class NovelPipelineModel(Base):
+    """Một lần chạy làm mượt → dịch → audio. stage: smoothing, translating, speaking, done, error."""
+
+    __tablename__ = "novel_pipelines"
+
+    novel_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    stage: Mapped[str] = mapped_column(String(20), default="smoothing")
+    voice_preset: Mapped[str] = mapped_column(String(40), default="nam_ke")
+    engine: Mapped[str] = mapped_column(String(20), default="edge")
+    translate_work_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    translate_variant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tts_work_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

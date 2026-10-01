@@ -8,6 +8,13 @@ _TEST_DB = Path(tempfile.gettempdir()) / "crawl_service_test.sqlite3"
 if _TEST_DB.exists():
     _TEST_DB.unlink()
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB}"
+# Không chạy APScheduler thật trong test — tick lịch hàng ngày (đến hạn khi
+# đã qua giờ hẹn) có thể tự quét site thật nếu 1 test bật daily_enabled.
+os.environ["CRAWL_ENABLED"] = "false"
+# Nguồn demo_local (đọc file fixtures) tắt mặc định ngoài test.
+os.environ["CRAWL_ENABLE_DEMO_SOURCE"] = "true"
+# Test chạy không token (FOLIO_API_TOKEN trong env máy dev không được lọt vào).
+os.environ.pop("FOLIO_API_TOKEN", None)
 
 import pytest  # noqa: E402 (phải set DATABASE_URL trước khi import bất kỳ gì đụng tới app)
 from fastapi.testclient import TestClient  # noqa: E402

@@ -13,6 +13,7 @@ from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef, NovelRef
 from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
 from crawl.infrastructure.sources.content_pipeline import assert_not_vip_locked, ocr_image_bytes
+from crawl.infrastructure.sources.fetch_guard import assert_public_url, url_belongs_to_source
 _BOOK = re.compile(r"/book/(\d+)")
 _CHAPTER = re.compile(r"/chapter/(\d+)")
 
@@ -59,8 +60,9 @@ class CiweimaoComSource(BaseHtmlSource):
             headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
             headers["X-Requested-With"] = "XMLHttpRequest"
             headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-        if cookie:
+        if cookie and url_belongs_to_source(url, self):
             headers["Cookie"] = cookie
+        assert_public_url(url)
 
         try:
             from curl_cffi import requests as crequests

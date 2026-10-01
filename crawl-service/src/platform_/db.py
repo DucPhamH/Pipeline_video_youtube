@@ -29,6 +29,7 @@ if _is_sqlite:
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=60000")
         cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA foreign_keys=ON")
         cursor.close()
 
 
@@ -80,34 +81,12 @@ def is_sqlite_locked(exc: BaseException) -> bool:
     return "locked" in msg or "busy" in msg
 
 
-def _ensure_sqlite_novel_columns() -> None:
-    """create_all không ALTER cột mới trên bảng đã tồn tại — bổ sung author/
-    cover_url/content_fingerprint nếu DB cũ thiếu."""
-    if not _is_sqlite:
-        return
-    from sqlalchemy import text
-
-    with engine.begin() as conn:
-        rows = conn.execute(text("PRAGMA table_info(novels)")).fetchall()
-        cols = {row[1] for row in rows}
-        alters = [
-            ("author", "ALTER TABLE novels ADD COLUMN author VARCHAR(255) DEFAULT ''"),
-            ("cover_url", "ALTER TABLE novels ADD COLUMN cover_url VARCHAR(500) DEFAULT ''"),
-            (
-                "content_fingerprint",
-                "ALTER TABLE novels ADD COLUMN content_fingerprint VARCHAR(64) DEFAULT ''",
-            ),
-        ]
-        for name, ddl in alters:
-            if name not in cols:
-                conn.execute(text(ddl))
-
-
 def init_db():
     # Import mọi module models.py của từng context để đăng ký bảng trước
     # khi create_all — mỗi context tự thêm dòng import ở đây khi có bảng mới.
     from crawl.infrastructure.persistence import models as crawl_models  # noqa: F401
+    from platform_.migrate import apply_migrations
     from platform_ import settings_store  # noqa: F401  (bảng Settings key-value)
 
     Base.metadata.create_all(bind=engine)
-    _ensure_sqlite_novel_columns()
+    apply_migrations(engine)

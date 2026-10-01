@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useState } from "react"
+import { FlaskConical, Play } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
-import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table"
-import { PageHeader, PageShell, SectionCard, Toolbar } from "@/components/PageChrome"
+import { EmptyState } from "@/components/EmptyState"
+import { PageHeader, PageShell, SectionCard } from "@/components/PageChrome"
+import { StatusPill } from "@/components/StatusPill"
 import { useT } from "@/i18n"
 import { ApiError } from "../../../api/client"
 import type { DryRunMode, DryRunResult } from "../../../api/types"
 import { crawlApi } from "../api"
+import { SettingRow } from "../components/SettingRow"
 
 export function DevToolsPage() {
   const t = useT()
@@ -59,86 +61,106 @@ export function DevToolsPage() {
 
   return (
     <PageShell>
-      <PageHeader title={t("dev.title")} description={t("dev.desc")} />
+      <PageHeader eyebrow={t("dev.eyebrow")} stage="collect" title={t("dev.title")} description={t("dev.desc")} />
 
-      <SectionCard title={t("dev.run")}>
-        <form onSubmit={handleRun} className="space-y-3">
-          <Toolbar>
-            <Select value={sourceKey} onValueChange={(v) => v && setSourceKey(v)}>
-              <SelectTrigger className="h-10 w-44">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {sourceKeys.map((key) => (
-                  <SelectItem key={key} value={key}>
-                    {key}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Select value={mode} onValueChange={(v) => v && setMode(v as DryRunMode)}>
-              <SelectTrigger className="h-10 w-64">
-                <SelectValue>{(v: DryRunMode) => modeLabels[v] ?? v}</SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {(Object.keys(modeLabels) as DryRunMode[]).map((m) => (
-                  <SelectItem key={m} value={m}>
-                    {modeLabels[m]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Input
-              type="text"
-              required
-              placeholder={t("dev.urlPlaceholder")}
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              className="h-10 min-w-[16rem] flex-1"
-            />
-            <Button type="submit" disabled={running} className="h-10">
+      <SectionCard title={t("dev.formTitle")} description={t("dev.formHint")}>
+        <form onSubmit={handleRun}>
+          <div className="divide-y divide-border">
+            <SettingRow label={t("dev.source")} htmlFor="dev-source">
+              <Select value={sourceKey} onValueChange={(v) => v && setSourceKey(v)}>
+                <SelectTrigger id="dev-source" className="h-10 w-full sm:w-64">
+                  <SelectValue>{(v: string) => v || "—"}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {sourceKeys.map((key) => (
+                    <SelectItem key={key} value={key}>
+                      {key}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <SettingRow label={t("dev.mode")} htmlFor="dev-mode">
+              <Select value={mode} onValueChange={(v) => v && setMode(v as DryRunMode)}>
+                <SelectTrigger id="dev-mode" className="h-10 w-full sm:w-64">
+                  <SelectValue>{(v: DryRunMode) => modeLabels[v] ?? v}</SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(modeLabels) as DryRunMode[]).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {modeLabels[m]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </SettingRow>
+            <SettingRow label={t("dev.url")} htmlFor="dev-url">
+              <Input
+                id="dev-url"
+                type="text"
+                required
+                inputMode="url"
+                placeholder={t("dev.urlPlaceholder")}
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                className="h-10 w-full font-mono text-sm"
+              />
+            </SettingRow>
+          </div>
+          <div className="mt-5 flex justify-end">
+            <Button type="submit" disabled={running}>
+              <Play className="size-4" />
               {running ? t("dev.running") : t("dev.run")}
             </Button>
-          </Toolbar>
+          </div>
         </form>
       </SectionCard>
 
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      {error ? (
+        <Alert variant="destructive" className="border-danger/25 bg-danger-soft px-4 py-3">
+          <AlertDescription className="text-danger">{error}</AlertDescription>
+        </Alert>
+      ) : null}
 
       {result ? (
         <SectionCard
           title={
-            result.ok ? (
-              <span className="text-emerald-700 dark:text-emerald-400">{t("dev.ok")}</span>
-            ) : (
-              <span className="text-destructive">{result.error ?? t("dev.fail")}</span>
-            )
+            <span className="flex flex-wrap items-center gap-2">
+              {t("dev.result")}
+              <StatusPill
+                status={result.ok ? "succeeded" : "failed"}
+                label={result.ok ? t("dev.ok") : t("dev.fail")}
+              />
+            </span>
           }
+          description={!result.ok && result.error ? result.error : undefined}
         >
           {result.preview ? (
-            <Table>
-              <TableBody>
-                {result.preview.map((item, i) => (
-                  <TableRow key={i}>
-                    <TableCell className="w-10 text-muted-foreground">{item.index ?? i + 1}</TableCell>
-                    <TableCell className="font-medium">{item.title}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{item.url}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <ol className="divide-y rounded-xl border">
+              {result.preview.map((item, i) => (
+                <li key={i} className="flex flex-col gap-0.5 px-3 py-2.5 sm:flex-row sm:items-baseline sm:gap-3">
+                  <span className="w-10 shrink-0 font-mono text-xs text-muted-foreground tabular-nums">
+                    {item.index ?? i + 1}
+                  </span>
+                  <span className="min-w-0 font-medium">{item.title}</span>
+                  <span className="min-w-0 truncate font-mono text-xs text-muted-foreground sm:ml-auto sm:max-w-[45%]" title={item.url}>
+                    {item.url}
+                  </span>
+                </li>
+              ))}
+            </ol>
           ) : null}
 
           {result.content_preview !== null && result.content_preview !== undefined ? (
-            <div className="space-y-2">
-              <p className="text-xs text-muted-foreground">
-                {t("dev.charsValidate", { count: result.content_length ?? 0 })}{" "}
-                <span className={result.validation_passed ? "text-emerald-600" : "text-destructive"}>
-                  {result.validation_passed ? t("dev.pass") : t("dev.noPass")}
-                </span>
-              </p>
-              <Separator />
-              <pre className="whitespace-pre-wrap rounded-lg bg-muted p-3 text-xs">
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2 text-[13px] text-muted-foreground">
+                <span>{t("dev.charsValidate", { count: result.content_length ?? 0 })}</span>
+                <StatusPill
+                  status={result.validation_passed ? "succeeded" : "failed"}
+                  label={result.validation_passed ? t("dev.pass") : t("dev.noPass")}
+                />
+              </div>
+              <pre className="max-h-[60vh] overflow-auto rounded-xl bg-muted p-4 text-sm leading-relaxed whitespace-pre-wrap">
                 {result.content_preview}
               </pre>
             </div>
@@ -147,9 +169,9 @@ export function DevToolsPage() {
       ) : null}
 
       {!result && !error ? (
-        <Alert>
-          <AlertDescription>{t("dev.empty")}</AlertDescription>
-        </Alert>
+        <div className="rounded-2xl border border-dashed bg-card">
+          <EmptyState icon={FlaskConical} tone="collect" title={t("dev.emptyTitle")} hint={t("dev.empty")} />
+        </div>
       ) : null}
     </PageShell>
   )

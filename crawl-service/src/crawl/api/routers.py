@@ -21,8 +21,10 @@ from sqlalchemy.orm import Session
 from crawl.infrastructure.sources.browser_fetch import close_browser
 
 from crawl.api.schemas import (
-    AddNovelIn, BatchExportIn, ChapterContentIn, ChapterContentOut, ChapterListOut, ChapterOut, ChapterRetryOut,
-    CrawlNovelResultOut, DeleteOut, DryRunIn, DryRunOut, GenreListOut, GenreOut, GenreProgressOut,
+    AddNovelIn, BatchExportIn, ChapterContentIn, ChapterContentOut, ChapterListOut, ChapterOut,
+    ChapterRetryOut,
+    CrawlNovelResultOut, DeleteOut, DryRunIn, DryRunOut, FollowIn, FollowListOut, FollowOut,
+    GenreListOut, GenreOut, GenreProgressOut, PipelineIn, PipelineListOut, PipelineOut,
     GenreToggleIn, NovelExportStatusOut, NovelListOut, NovelOut, RetryErrorsIn, RetryErrorsOut,
     ReviewAllOut, SendToTranslateIn, SendToTranslateOut, SettingsOut, SettingsPatchIn, SiteListOut,
     SiteSessionIn, SiteSessionOut, SiteSessionProbeOut, SmoothNovelIn, SmoothNovelOut,
@@ -35,8 +37,9 @@ from crawl.application.use_cases import (
     RetryChapterUseCase, ReviewAllChaptersUseCase, SetActiveGenreUseCase, SmoothNovelUseCase,
     UpdateChapterContentUseCase,
 )
-from crawl.domain.entities import GenreRunStatus
+from crawl.domain.entities import ChapterStatus, GenreRunStatus
 from crawl.domain.ports import ChapterRepository, GenreRepository, NovelRepository
+from crawl.infrastructure.persistence.models import NovelFollowModel, NovelPipelineModel
 from crawl.infrastructure.persistence.repositories import (
     SqlAlchemyChapterRepository, SqlAlchemyGenreRepository, SqlAlchemyNovelRepository,
 )
@@ -45,7 +48,7 @@ from crawl.infrastructure.sources.site_access import SiteAccessKind, site_access
 from crawl.infrastructure.sources.site_regions import SiteRegion, site_region
 from platform_.config import config
 from platform_.db import SessionLocal, get_db
-from platform_.locks import release, try_acquire
+from platform_.locks import is_locked, release, try_acquire
 from platform_.settings_store import get_all, get_per_site_int, get_per_site_setting, set_setting
 
 logger = logging.getLogger("crawl")
@@ -434,7 +437,7 @@ def run_genre_now(genre_id: int, genre_repo: GenreRepository = Depends(get_genre
         raise HTTPException(409, f"Đang có yêu cầu khác xử lý '{lock_key}', vui lòng đợi rồi thử lại")
 
     genre.mark_run_started()
-    genre_repo.update(genre)
+    genre_repo.update_run_state(genre)
     threading.Thread(target=_run_genre_in_background, args=(genre_id, lock_key), daemon=True).start()
     return genre_repo.get_by_id(genre_id)
 
@@ -461,10 +464,93 @@ def cancel_genre_run(genre_id: int, genre_repo: GenreRepository = Depends(get_ge
         raise HTTPException(404, "Không tìm thấy thể loại")
     if genre.last_run_status != GenreRunStatus.RUNNING:
         raise HTTPException(409, "Không có lượt quét đang chạy để dừng")
+    if not is_locked(f"genre-run:{genre_id}"):
+        # Không thread nào giữ khoá: RUNNING là trạng thái mồ côi, không còn ai để nhận cờ dừng.
+        genre.mark_run_finished(
+            status=GenreRunStatus.CANCELLED, discovered=0, rejected=0, errors=0,
+            messages=["Đã dừng: không còn lượt quét nào chạy thật"],
+        )
+        genre_repo.update_run_state(genre)
+        return genre_repo.get_by_id(genre_id)
     from platform_.run_cancel import request_cancel
 
     request_cancel(genre_id)
     return genre
+
+
+def _notify_genre_run(db: Session, genre_repo: GenreRepository, genre_id: int, result) -> None:
+    """Webhook khi "Quét ngay" xong — cùng format với lịch hàng ngày; chỉ gửi
+    khi đã cấu hình notify.webhook_url."""
+    from crawl.application.notify import format_scan_summary, notify_configured
+
+    try:
+        genre = genre_repo.get_by_id(genre_id)
+        summary = {
+            "source_key": genre.source_key if genre else "?",
+            "genre_label": genre.label if genre else str(genre_id),
+            "discovered": result.discovered,
+            "synced": result.synced,
+            "rejected": result.rejected,
+            "errors": result.errors,
+        }
+        title = "Quét ngay đã dừng" if result.cancelled else "Quét ngay xong"
+        notify_configured(db, title=title, body=format_scan_summary([summary]))
+    except Exception:
+        logger.exception("Không gửi được webhook cho genre %s", genre_id)
+
+
+def _notify_novel_failure(db: Session, novel_id: int, result) -> None:
+    """Webhook khi crawl 1 truyện (Thử lại / thêm tay / force-accept) thất bại."""
+    if result is None or result.success or getattr(result, "cancelled", False):
+        return
+    from crawl.application.notify import notify_configured
+
+    try:
+        novel = SqlAlchemyNovelRepository(db).get_by_id(novel_id)
+        name = f"#{novel_id} {novel.title}" if novel else f"#{novel_id}"
+        notify_configured(db, title="Crawl truyện lỗi", body=f"{name}: {result.error or 'lỗi không rõ'}")
+    except Exception:
+        logger.exception("Không gửi được webhook lỗi crawl novel %s", novel_id)
+
+
+def _mark_genre_crashed(genre_id: int, exc: Exception) -> None:
+    """Thread chết ngoài execute thì genre còn RUNNING mãi, nút quét bị khoá."""
+    db = SessionLocal()
+    try:
+        repo = SqlAlchemyGenreRepository(db)
+        genre = repo.get_by_id(genre_id)
+        if genre is None or genre.last_run_status != GenreRunStatus.RUNNING:
+            return
+        genre.mark_run_finished(
+            status=GenreRunStatus.ERROR,
+            discovered=0,
+            rejected=0,
+            errors=1,
+            messages=[f"Lỗi khi chạy nền: {exc}"[:500]],
+        )
+        repo.update_run_state(genre)
+    except Exception:
+        logger.exception("Không ghi được trạng thái error cho genre %s", genre_id)
+    finally:
+        db.close()
+
+
+def _mark_novel_crashed(novel_id: int, exc: Exception) -> None:
+    """Thread chết trước/ngoài execute thì truyện còn CRAWLING mãi, không xoá được."""
+    from crawl.domain.entities import NovelLifecycle
+
+    db = SessionLocal()
+    try:
+        repo = SqlAlchemyNovelRepository(db)
+        novel = repo.get_by_id(novel_id)
+        if novel is None or novel.lifecycle_status != NovelLifecycle.CRAWLING:
+            return
+        novel.mark_error(f"Lỗi khi crawl nền: {exc}"[:500])
+        repo.update(novel)
+    except Exception:
+        logger.exception("Không ghi được trạng thái error cho novel %s", novel_id)
+    finally:
+        db.close()
 
 
 def _run_genre_in_background(genre_id: int, lock_key: str) -> None:
@@ -482,13 +568,15 @@ def _run_genre_in_background(genre_id: int, lock_key: str) -> None:
                 novel_repo=SqlAlchemyNovelRepository(db), chapter_repo=SqlAlchemyChapterRepository(db)
             ),
         )
-        use_case.execute(genre_id)  # tự lưu last_run_* khi xong (kể cả khi lỗi) — xem use_cases.py
-    except Exception:
+        result = use_case.execute(genre_id)  # tự lưu last_run_* khi xong (kể cả khi lỗi)
+        _notify_genre_run(db, genre_repo, genre_id, result)
+    except Exception as exc:
         logger.exception("Lỗi không mong đợi khi chạy nền genre %s", genre_id)
         try:
             db.rollback()
         except Exception:
             pass
+        _mark_genre_crashed(genre_id, exc)
     finally:
         close_browser()  # đóng Chromium của thread này nếu đã mở — mục 4c
         db.close()
@@ -496,6 +584,26 @@ def _run_genre_in_background(genre_id: int, lock_key: str) -> None:
 
 
 # ---------------------------------------------------------------- Novels --
+
+def _novels_out(novels: list, chapter_repo: ChapterRepository) -> list[NovelOut]:
+    """Domain Novel -> NovelOut kèm đếm chương crawled/failed (1 query)."""
+    from crawl.application.use_cases import DONE_CHAPTER_STATUSES
+
+    done = {s.value for s in DONE_CHAPTER_STATUSES}
+    counts = chapter_repo.count_status_by_novels([n.id for n in novels if n.id is not None])
+    out: list[NovelOut] = []
+    for n in novels:
+        by_status = counts.get(n.id, {})
+        out.append(
+            NovelOut.model_validate(n).model_copy(
+                update={
+                    "crawled_chapters": sum(v for k, v in by_status.items() if k in done),
+                    "failed_chapters": by_status.get(ChapterStatus.FAILED.value, 0),
+                }
+            )
+        )
+    return out
+
 
 @router.get("/novels", response_model=NovelListOut)
 def list_novels(
@@ -507,6 +615,7 @@ def list_novels(
     limit: int = 20,
     offset: int = 0,
     novel_repo: NovelRepository = Depends(get_novel_repo),
+    chapter_repo: ChapterRepository = Depends(get_chapter_repo),
 ):
     """Phân trang + lọc theo site / trạng thái / thể loại quét / tay-vs-quét."""
     limit = max(1, min(limit, 100))
@@ -527,18 +636,32 @@ def list_novels(
         is_manual=is_manual,
         genre_id=genre_id,
     )
-    return {"items": items, "total": total}
+    return {"items": _novels_out(items, chapter_repo), "total": total}
 
 
 @router.get("/novels/{novel_id}", response_model=NovelOut)
 def get_novel(
     novel_id: int,
     novel_repo: NovelRepository = Depends(get_novel_repo),
+    chapter_repo: ChapterRepository = Depends(get_chapter_repo),
 ):
     novel = novel_repo.get_by_id(novel_id)
     if novel is None:
         raise HTTPException(404, "Không tìm thấy truyện")
-    return novel
+    return _novels_out([novel], chapter_repo)[0]
+
+
+@router.get("/novels/{novel_id}/progress")
+def get_novel_progress(novel_id: int, novel_repo: NovelRepository = Depends(get_novel_repo)):
+    """Tiến độ live khi crawl 1 truyện (Thử lại / thêm tay / force-accept) —
+    snapshot in-memory `novel:{id}`, cùng shape với /genres/{id}/progress.
+    `progress=null` nếu chưa/không có lượt chạy nào trong tiến trình này."""
+    if novel_repo.get_by_id(novel_id) is None:
+        raise HTTPException(404, "Không tìm thấy truyện")
+    from platform_.run_progress import as_api_dict, get
+
+    data = as_api_dict(get(f"novel:{novel_id}"))
+    return {"progress": GenreProgressOut(**data) if data else None}
 
 
 @router.get("/novels/{novel_id}/translate-handoff", response_model=TranslateHandoffOut)
@@ -598,6 +721,7 @@ def get_translate_handoff(
                 has_cleaned=has_cleaned,
                 reviewed=bool(ch.reviewed),
                 crawl_chapter_id=ch.id,
+                order=ch.sort_key[0],
             )
         )
 
@@ -639,6 +763,9 @@ def send_novel_to_translate(
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if result.error:
+        # Work đã tạo + novel đã đánh dấu translating, chỉ start job lỗi.
+        raise HTTPException(502, result.error)
     return SendToTranslateOut(
         novel_id=novel_id,
         lifecycle_status=result.novel.lifecycle_status.value,
@@ -648,6 +775,7 @@ def send_novel_to_translate(
         missing_cleaned=result.missing_cleaned,
         unreviewed=result.unreviewed,
         translate_path=f"/translate/{result.work_id}",
+        warnings=result.warnings,
     )
 
 
@@ -668,6 +796,12 @@ def translate_lifecycle_callback(
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    from crawl.application.pipeline import on_translate_status
+
+    on_translate_status(db, novel_id, body.status, body.message)
+    from crawl.application.follow import on_follow_audio
+
+    on_follow_audio(db, novel_id, body.status)
     return novel
 
 
@@ -732,6 +866,7 @@ def list_novel_chapters(
                 error_message=ch.error_message,
                 reviewed=ch.reviewed,
                 has_cleaned=chapter_has_cleaned,
+                toc_order=ch.toc_order,
             )
         )
     return {"items": out_items, "total": total}
@@ -745,13 +880,15 @@ def _crawl_novel_in_background(novel_id: int, lock_key: str, *, incremental: boo
             novel_repo=SqlAlchemyNovelRepository(db),
             chapter_repo=SqlAlchemyChapterRepository(db),
         )
-        use_case.execute(novel_id, incremental=incremental)
-    except Exception:
+        result = use_case.execute(novel_id, incremental=incremental)
+        _notify_novel_failure(db, novel_id, result)
+    except Exception as exc:
         logger.exception("Lỗi không mong đợi khi crawl nền novel %s", novel_id)
         try:
             db.rollback()
         except Exception:
             pass
+        _mark_novel_crashed(novel_id, exc)
     finally:
         close_browser()  # đóng Chromium của thread này nếu đã mở — mục 4c
         db.close()
@@ -766,7 +903,9 @@ def add_novel(
 ):
     """Validate + tạo Novel đồng bộ; crawl chạy NỀN (202) — tránh giữ
     threadpool API hàng phút (giống /genres/.../run-now)."""
-    lock_key = f"add-novel:{body.source_key}:{body.url}"
+    from crawl.domain.urls import normalize_novel_url
+
+    lock_key = f"add-novel:{body.source_key}:{normalize_novel_url(body.url) or body.url}"
     if not try_acquire(lock_key):
         raise HTTPException(409, f"Đang có yêu cầu khác xử lý '{lock_key}', vui lòng đợi rồi thử lại")
     try:
@@ -842,6 +981,150 @@ def retry_novel(novel_id: int, response: Response, novel_repo: NovelRepository =
     ).start()
     response.status_code = 202
     return CrawlNovelResultOut(novel_id=novel_id, chapters_crawled=0, success=True, error=None)
+
+
+def _follow_out(db: Session, row: NovelFollowModel) -> FollowOut | None:
+    novel = SqlAlchemyNovelRepository(db).get_by_id(row.novel_id)
+    if novel is None:
+        return None
+    return FollowOut(
+        novel_id=row.novel_id,
+        title=novel.title,
+        lifecycle_status=novel.lifecycle_status.value,
+        total_chapters=novel.total_chapters,
+        auto_translate=bool(row.auto_translate),
+        auto_audio=bool(row.auto_audio),
+        voice_preset=row.voice_preset or "nam_ke",
+        tts_work_id=row.tts_work_id,
+        last_checked_at=row.last_checked_at,
+        last_new_chapters=row.last_new_chapters or 0,
+        last_error=row.last_error,
+        checking=is_locked(f"follow-check:{row.novel_id}"),
+    )
+
+
+def _pipeline_out(db: Session, row: NovelPipelineModel) -> PipelineOut | None:
+    novel = SqlAlchemyNovelRepository(db).get_by_id(row.novel_id)
+    if novel is None:
+        return None
+    return PipelineOut(
+        novel_id=row.novel_id,
+        title=novel.title,
+        stage=row.stage,
+        voice_preset=row.voice_preset,
+        engine=row.engine,
+        translate_work_id=row.translate_work_id,
+        tts_work_id=row.tts_work_id,
+        error=row.error,
+    )
+
+
+def _pipeline_thread(novel_id: int, lock_key: str) -> None:
+    from crawl.application.pipeline import execute
+
+    db = SessionLocal()
+    try:
+        execute(db, novel_id)
+    except Exception:
+        logger.exception("Lỗi khi chạy pipeline novel %s", novel_id)
+        from crawl.application.pipeline import _fail
+
+        _fail(db, novel_id, "Lỗi không mong đợi khi chạy chuỗi")
+    finally:
+        db.close()
+        release(lock_key)
+
+
+@router.get("/pipelines", response_model=PipelineListOut)
+def list_pipelines(db: Session = Depends(get_db)):
+    rows = db.query(NovelPipelineModel).order_by(NovelPipelineModel.updated_at.desc()).all()
+    return PipelineListOut(items=[out for row in rows if (out := _pipeline_out(db, row)) is not None])
+
+
+@router.post("/novels/{novel_id}/pipeline", response_model=PipelineOut, status_code=202)
+def start_pipeline(novel_id: int, body: PipelineIn, db: Session = Depends(get_db)):
+    from crawl.application.pipeline import PipelineBusy, begin
+
+    lock_key = f"pipeline:{novel_id}"
+    if not try_acquire(lock_key):
+        raise HTTPException(409, "Chuỗi này đang chạy")
+    try:
+        row = begin(db, novel_id, voice_preset=body.voice_preset, engine=body.engine)
+    except LookupError as exc:
+        release(lock_key)
+        raise HTTPException(404, str(exc)) from exc
+    except PipelineBusy as exc:
+        release(lock_key)
+        raise HTTPException(409, "Chuỗi này đang chạy") from exc
+    except ValueError as exc:
+        release(lock_key)
+        raise HTTPException(400, str(exc)) from exc
+    threading.Thread(target=_pipeline_thread, args=(novel_id, lock_key), daemon=True).start()
+    return _pipeline_out(db, row)
+
+
+@router.get("/follows", response_model=FollowListOut)
+def list_follows(db: Session = Depends(get_db)):
+    rows = db.query(NovelFollowModel).order_by(NovelFollowModel.created_at.desc()).all()
+    return FollowListOut(items=[out for row in rows if (out := _follow_out(db, row)) is not None])
+
+
+@router.put("/novels/{novel_id}/follow", response_model=FollowOut)
+def follow_novel(novel_id: int, body: FollowIn, db: Session = Depends(get_db)):
+    if SqlAlchemyNovelRepository(db).get_by_id(novel_id) is None:
+        raise HTTPException(404, "Không tìm thấy truyện")
+    from crawl.application.pipeline import PRESETS
+
+    row = db.get(NovelFollowModel, novel_id) or NovelFollowModel(novel_id=novel_id)
+    preset = (body.voice_preset or "nam_ke").strip()
+    if preset not in PRESETS:
+        raise HTTPException(400, "Preset giọng không hợp lệ")
+    row.auto_translate = body.auto_translate
+    row.auto_audio = body.auto_audio
+    row.voice_preset = preset
+    db.add(row)
+    db.commit()
+    return _follow_out(db, row)
+
+
+@router.delete("/novels/{novel_id}/follow", status_code=204)
+def unfollow_novel(novel_id: int, db: Session = Depends(get_db)):
+    row = db.get(NovelFollowModel, novel_id)
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return Response(status_code=204)
+
+
+def _check_follow_in_background(novel_id: int, lock_key: str, check_key: str) -> None:
+    from crawl.application.follow import check_follow
+
+    db = SessionLocal()
+    try:
+        check_follow(db, novel_id, source_resolver=get_source)
+    except Exception:
+        logger.exception("Lỗi khi kiểm tra truyện theo dõi %s", novel_id)
+    finally:
+        close_browser()
+        db.close()
+        release(check_key)
+        release(lock_key)
+
+
+@router.post("/novels/{novel_id}/follow/check", response_model=FollowOut, status_code=202)
+def check_follow_now(novel_id: int, db: Session = Depends(get_db)):
+    row = db.get(NovelFollowModel, novel_id)
+    if row is None:
+        raise HTTPException(404, "Truyện chưa được theo dõi")
+    lock_key = f"crawl-novel:{novel_id}"
+    if not try_acquire(lock_key):
+        raise HTTPException(409, "Truyện đang được cào, thử lại sau")
+    check_key = f"follow-check:{novel_id}"
+    try_acquire(check_key)
+    threading.Thread(
+        target=_check_follow_in_background, args=(novel_id, lock_key, check_key), daemon=True
+    ).start()
+    return _follow_out(db, row)
 
 
 @router.post("/novels/retry-errors", response_model=RetryErrorsOut, status_code=202)
@@ -931,7 +1214,8 @@ def smooth_novel(
     """Làm mượt rule — `chapter_ids` rỗng/null = tất cả; có list = chỉ chọn.
     Ghi data/cleaned/, không đè raw. Kỹ thuật novel-processor (MIT)."""
     chapter_ids = body.chapter_ids if body is not None else None
-    result = use_case.execute(novel_id, chapter_ids=chapter_ids or None)
+    force = bool(body.force) if body is not None else False
+    result = use_case.execute(novel_id, chapter_ids=chapter_ids or None, force=force)
     if not result.success:
         raise HTTPException(400, result.error or "Không làm mượt được")
     return result
@@ -951,7 +1235,8 @@ def delete_novel(
     finally:
         release(lock_key)
     if not result.success:
-        raise HTTPException(400 if result.error and "Không tìm thấy" not in result.error else 404, result.error)
+        code = 400 if result.error and "Không tìm thấy" not in result.error else 404
+        raise HTTPException(code, result.error)
     return result
 
 
@@ -1077,7 +1362,8 @@ def review_all_chapters(
     """Đánh dấu đã review mọi chương đã có cleaned — không mở từng dialog."""
     result = use_case.execute(novel_id)
     if not result.success:
-        raise HTTPException(400 if result.error and "Không tìm thấy" not in result.error else 404, result.error)
+        code = 400 if result.error and "Không tìm thấy" not in result.error else 404
+        raise HTTPException(code, result.error)
     return result
 
 
@@ -1154,14 +1440,31 @@ def retry_chapter(
 
 @router.get("/settings", response_model=SettingsOut)
 def read_settings(db: Session = Depends(get_db)):
-    return {"values": get_all(db)}
+    """Cookie phiên chỉ trả has_cookie + hint; key nội bộ (scheduler…) bị ẩn."""
+    from crawl.api.settings_guard import public_settings
+
+    return {"values": public_settings(get_all(db))}
 
 
 @router.patch("/settings", response_model=SettingsOut)
 def update_settings(body: SettingsPatchIn, db: Session = Depends(get_db)):
-    for key, value in body.values.items():
+    """Chỉ nhận key đã biết (global + setting riêng từng site) với đúng kiểu
+    — sai thì 422, không ghi gì. Cookie phiên sửa qua PUT /sites/{k}/session."""
+    from crawl.api.settings_guard import daily_schedule_sources, public_settings, validate_settings_patch
+    from platform_.scheduler import seed_last_fired_if_past
+
+    clean, errors = validate_settings_patch(body.values)
+    if errors:
+        raise HTTPException(422, "Setting không hợp lệ: " + "; ".join(errors))
+    for key, value in clean.items():
         set_setting(db, key, value)
-    return {"values": get_all(db)}
+    # Bật/sửa lịch hàng ngày SAU giờ hẹn hôm nay -> không quét ngay, chờ ngày mai.
+    for source_key in daily_schedule_sources(list(clean)):
+        try:
+            seed_last_fired_if_past(db, source_key)
+        except Exception:
+            logger.exception("Không seed last_fired cho %s", source_key)
+    return {"values": public_settings(get_all(db))}
 
 
 # -------------------------------------------------------------- Dry-run --

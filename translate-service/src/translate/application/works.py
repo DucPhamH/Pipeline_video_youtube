@@ -8,6 +8,8 @@ from translate.domain.entities import JobStatus
 from translate.infrastructure.persistence.repositories import (
     GlossaryRepository,
     JobRepository,
+    NameApplyBatchRepository,
+    SkinMapRepository,
     VariantRepository,
     WorkRepository,
 )
@@ -31,6 +33,11 @@ def delete_work(db: Session, *, work_id: int) -> None:
     glossary_repo = GlossaryRepository(db)
     for term in glossary_repo.list_by_work(work_id):
         glossary_repo.delete(term.id)  # type: ignore[arg-type]
+    # Bảng đổi vỏ + lô áp tên không có relationship ORM — dọn tay như glossary.
+    skin_repo = SkinMapRepository(db)
+    for v in variant_repo.list_by_work(work_id):
+        skin_repo.delete_by_variant(v.id)  # type: ignore[arg-type]
+    NameApplyBatchRepository(db).delete_by_work(work_id)
 
     work_repo.delete(work_id)
     db.commit()

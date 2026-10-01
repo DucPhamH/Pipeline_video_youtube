@@ -1,15 +1,10 @@
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { StatusPill } from "@/components/StatusPill"
 import { useT } from "@/i18n"
 import { type SessionGuide, COMMON_COPY_METHODS } from "../sessionGuides"
 
 function NeedBadge({ level }: { level: SessionGuide["needsSession"][0]["level"] }) {
   const t = useT()
-  const cls =
-    level === "required"
-      ? "bg-amber-100 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
-      : level === "optional"
-        ? "bg-muted text-muted-foreground"
-        : "bg-emerald-100 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200"
   const label =
     level === "required"
       ? t("guide.needRequired")
@@ -17,9 +12,12 @@ function NeedBadge({ level }: { level: SessionGuide["needsSession"][0]["level"] 
         ? t("guide.needOptional")
         : t("guide.needNone")
   return (
-    <span className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>
-      {label}
-    </span>
+    <StatusPill
+      status={level}
+      label={label}
+      tone={level === "required" ? "warning" : level === "optional" ? "neutral" : "success"}
+      live={false}
+    />
   )
 }
 
@@ -33,7 +31,7 @@ function LoginLine({ loginUrl }: { loginUrl: string }) {
         href={loginUrl}
         target="_blank"
         rel="noopener noreferrer"
-        className="text-primary underline-offset-2 hover:underline"
+        className="text-accent-foreground font-semibold underline-offset-2 hover:underline"
       >
         {loginUrl}
       </a>
@@ -56,7 +54,7 @@ export function SessionGuidePanel({ guide }: { guide: SessionGuide }) {
         <p className="font-medium">{t("guide.loginOnBrowser")}</p>
         <LoginLine loginUrl={guide.loginUrl} />
         {guide.domainNote && (
-          <p className="text-xs text-amber-700 dark:text-amber-300">{guide.domainNote}</p>
+          <p className="text-[13px] font-medium text-warning">{guide.domainNote}</p>
         )}
       </div>
 
@@ -73,12 +71,12 @@ export function SessionGuidePanel({ guide }: { guide: SessionGuide }) {
         <p className="font-medium">{t("guide.whenNeedCookie")}</p>
         <ul className="space-y-2">
           {guide.needsSession.map((row) => (
-            <li key={row.task} className="rounded-md border px-3 py-2">
+            <li key={row.task} className="rounded-lg border px-3 py-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-medium">{row.task}</span>
                 <NeedBadge level={row.level} />
               </div>
-              <p className="mt-0.5 text-xs text-muted-foreground">{row.detail}</p>
+              <p className="mt-0.5 text-[13px] text-muted-foreground">{row.detail}</p>
             </li>
           ))}
         </ul>
@@ -86,7 +84,7 @@ export function SessionGuidePanel({ guide }: { guide: SessionGuide }) {
 
       <div className="space-y-1.5">
         <p className="font-medium">{t("guide.cookiesShouldHave")}</p>
-        <ul className="space-y-1 rounded-md border px-3 py-2 font-mono text-xs">
+        <ul className="space-y-1 rounded-lg border px-3 py-2 font-mono text-xs">
           {guide.keyCookies.map((c) => (
             <li key={c.name}>
               <span className="text-foreground">{c.name}</span>
@@ -101,16 +99,16 @@ export function SessionGuidePanel({ guide }: { guide: SessionGuide }) {
         {methods.map((method) => (
           <details
             key={method.title}
-            className="rounded-md border px-3 py-2"
+            className="rounded-lg border px-3 py-2"
             open={method.recommended}
           >
             <summary className="cursor-pointer font-medium">
               {method.title}
               {method.recommended && (
-                <span className="ml-2 text-xs font-normal text-primary">{t("guide.recommended")}</span>
+                <span className="ml-2 text-xs font-semibold text-accent-foreground">{t("guide.recommended")}</span>
               )}
             </summary>
-            <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs text-muted-foreground">
+            <ol className="mt-2 list-decimal space-y-1 pl-4 text-[13px] text-muted-foreground">
               {method.steps.map((step) => (
                 <li key={step}>{step}</li>
               ))}
@@ -146,16 +144,16 @@ export function GenericSessionInstructions() {
         {COMMON_COPY_METHODS.map((method) => (
           <details
             key={method.title}
-            className="rounded-md border px-3 py-2"
+            className="rounded-lg border px-3 py-2"
             open={method.recommended}
           >
             <summary className="cursor-pointer font-medium">
               {method.title}
               {method.recommended && (
-                <span className="ml-2 text-xs font-normal text-primary">{t("guide.recommended")}</span>
+                <span className="ml-2 text-xs font-semibold text-accent-foreground">{t("guide.recommended")}</span>
               )}
             </summary>
-            <ol className="mt-2 list-decimal space-y-1 pl-4 text-xs text-muted-foreground">
+            <ol className="mt-2 list-decimal space-y-1 pl-4 text-[13px] text-muted-foreground">
               {method.steps.map((step) => (
                 <li key={step}>{step}</li>
               ))}

@@ -6,11 +6,18 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { SectionCard } from "@/components/PageChrome"
+import { useConfirm } from "@/components/useConfirm"
 import { useT } from "@/i18n"
 import { ApiError } from "@/api/client"
 import { translateApi } from "../api"
 import { AI_CATALOG, KINDS_NO_KEY_REQUIRED, getCatalogEntry } from "../providerProfiles"
 import type { AiProvider, AiProviderInput } from "../types"
+import { ListSkeleton } from "@/components/Skeleton"
+import { ActionMenu, ActionMenuItem } from "@/components/ActionMenu"
+import { EmptyState } from "@/components/EmptyState"
+import { StatusPill } from "@/components/StatusPill"
+import { Bot, KeyRound, MoreHorizontal, Pencil, Plus, X } from "lucide-react"
+import { cn } from "@/lib/utils"
 
 type FormState = AiProviderInput
 
@@ -41,10 +48,14 @@ function CatalogKindHint({ kind }: { kind: string }) {
   const t = useT()
   const cat = getCatalogEntry(kind)
   if (!cat?.blurb && !cat?.docs_url) return null
+  // Blurb theo locale (aiCatalog.<id>); kind chưa dịch thì dùng blurb gốc trong catalog.
+  const blurbKey = `aiCatalog.${cat.id}`
+  const translated = t(blurbKey)
+  const blurb = translated === blurbKey ? cat.blurb : translated
   return (
     <p className="text-xs text-muted-foreground">
-      {cat.blurb}
-      {cat.blurb && cat.docs_url ? " — " : ""}
+      {blurb}
+      {blurb && cat.docs_url ? " — " : ""}
       {cat.docs_url ? (
         <a href={cat.docs_url} target="_blank" rel="noreferrer" className="underline underline-offset-2">
           {t("translate.aiProviderGetKeyLink")}
@@ -76,7 +87,7 @@ function ModelField({
     return (
       <div className="space-y-1">
         <Label>{t("translate.modelDefault")}</Label>
-        <Input value={value} onChange={(e) => onChange(e.target.value)} className="font-mono text-xs" placeholder="model-id" />
+        <Input value={value} onChange={(e) => onChange(e.target.value)} className="font-mono text-[13px]" placeholder="model-id" />
       </div>
     )
   }
@@ -85,7 +96,7 @@ function ModelField({
     <div className="space-y-1">
       <Label>{t("translate.modelDefault")}</Label>
       <select
-        className="flex h-9 w-full rounded-md border border-input bg-background px-2 font-mono text-xs"
+        className="flex h-9 w-full rounded-lg border border-input bg-card px-2.5 font-mono text-[13px]"
         value={inList ? value : "__custom__"}
         onChange={(e) => onChange(e.target.value === "__custom__" ? "" : e.target.value)}
       >
@@ -102,7 +113,7 @@ function ModelField({
             value={value}
             onChange={(e) => onChange(e.target.value)}
             placeholder="model-id"
-            className="mt-1.5 h-9 font-mono text-xs"
+            className="mt-1.5 h-9 font-mono text-[13px]"
           />
           <p className="text-xs text-muted-foreground">{t("translate.customModelHint")}</p>
         </>
@@ -146,16 +157,16 @@ function ExtraKeysField({
           {keys.map((k, i) => (
             <span
               key={i}
-              className="inline-flex items-center gap-1 rounded-full border border-input bg-muted px-2 py-0.5 font-mono text-xs"
+              className="inline-flex h-7 items-center gap-1 rounded-full bg-muted pr-1 pl-2.5 font-mono text-xs"
             >
               {maskKeyTail(k)}
               <button
                 type="button"
                 onClick={() => onChange(keys.filter((_, idx) => idx !== i))}
-                className="text-muted-foreground hover:text-foreground"
+                className="flex size-5 items-center justify-center rounded-full text-muted-foreground hover:bg-card hover:text-foreground"
                 aria-label={t("common.confirmDelete")}
               >
-                ×
+                <X className="size-3" aria-hidden />
               </button>
             </span>
           ))}
@@ -173,9 +184,9 @@ function ExtraKeysField({
             }
           }}
           placeholder="sk-…"
-          className="h-8 font-mono text-xs"
+          className="font-mono text-[13px]"
         />
-        <Button type="button" size="sm" variant="outline" onClick={add}>
+        <Button type="button" variant="outline" onClick={add}>
           {t("translate.modelAddCustom")}
         </Button>
       </div>
@@ -233,17 +244,17 @@ function LiveExtraKeysField({
           {extraHints.map((hint, i) => (
             <span
               key={i}
-              className="inline-flex items-center gap-1 rounded-full border border-input bg-muted px-2 py-0.5 font-mono text-xs"
+              className="inline-flex h-7 items-center gap-1 rounded-full bg-muted pr-1 pl-2.5 font-mono text-xs"
             >
               …{hint.replace(/^…/, "")}
               <button
                 type="button"
                 disabled={busy}
                 onClick={() => void remove(i + 1)}
-                className="text-muted-foreground hover:text-foreground disabled:opacity-50"
+                className="flex size-5 items-center justify-center rounded-full text-muted-foreground hover:bg-card hover:text-foreground disabled:opacity-50"
                 aria-label={t("common.confirmDelete")}
               >
-                ×
+                <X className="size-3" aria-hidden />
               </button>
             </span>
           ))}
@@ -261,10 +272,10 @@ function LiveExtraKeysField({
             }
           }}
           placeholder="sk-…"
-          className="h-8 font-mono text-xs"
+          className="font-mono text-[13px]"
           disabled={busy}
         />
-        <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void add()}>
+        <Button type="button" variant="outline" disabled={busy} onClick={() => void add()}>
           {t("translate.modelAddCustom")}
         </Button>
       </div>
@@ -274,7 +285,9 @@ function LiveExtraKeysField({
 
 export function AiProvidersPanel() {
   const t = useT()
+  const [confirm, confirmDialog] = useConfirm()
   const [items, setItems] = useState<AiProvider[]>([])
+  const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [adding, setAdding] = useState(false)
   const [form, setForm] = useState<FormState>(blankForm())
@@ -287,6 +300,7 @@ export function AiProvidersPanel() {
       .listAiProviders()
       .then(setItems)
       .catch((err) => setLoadError(err instanceof ApiError ? err.message : t("app.unknownError")))
+      .finally(() => setLoaded(true))
   }
 
   useEffect(() => {
@@ -368,7 +382,11 @@ export function AiProvidersPanel() {
   }
 
   async function handleDelete(id: number) {
-    if (!window.confirm(t("translate.aiProviderDeleteConfirm"))) return
+    const confirmed = await confirm({
+      title: t("common.deleteTitle"),
+      description: t("translate.aiProviderDeleteConfirm"),
+    })
+    if (!confirmed) return
     try {
       await translateApi.deleteAiProvider(id)
       setItems((list) => list.filter((p) => p.id !== id))
@@ -388,6 +406,11 @@ export function AiProvidersPanel() {
     return p.key_count > 1 ? `${base} (+${p.key_count - 1})` : base
   }
 
+  function keyTone(p: AiProvider): "success" | "warning" | "neutral" {
+    if (!p.requires_api_key) return "neutral"
+    return p.has_api_key ? "success" : "warning"
+  }
+
   if (loadError) {
     return (
       <SectionCard title={t("settings.aiProviders")}>
@@ -403,23 +426,39 @@ export function AiProvidersPanel() {
       actions={
         !adding ? (
           <Button type="button" size="sm" onClick={() => setAdding(true)}>
+            <Plus aria-hidden />
             {t("translate.aiProviderAdd")}
           </Button>
         ) : null
       }
     >
-      {items.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{t("app.loading")}</p>
+      {!loaded ? (
+        <ListSkeleton />
+      ) : items.length === 0 ? (
+        adding ? null : (
+          <EmptyState
+            icon={Bot}
+            tone="translate"
+            compact
+            title={t("translate.noAiProvidersYet")}
+            action={
+              <Button type="button" onClick={() => setAdding(true)}>
+                <Plus aria-hidden />
+                {t("translate.aiProviderAdd")}
+              </Button>
+            }
+          />
+        )
       ) : (
-        <ul className="divide-y divide-border text-sm">
+        <ul className="stagger -mx-2 divide-y divide-border text-sm">
           {items.map((p) =>
             editingId === p.id ? (
-              <li key={p.id} className="space-y-3 py-3">
+              <li key={p.id} className="my-2 space-y-3 rounded-xl border border-primary/40 bg-accent/30 p-4">
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="space-y-1">
                     <Label>{t("translate.aiProviderKind")}</Label>
                     <select
-                      className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                      className="flex h-9 w-full rounded-lg border border-input bg-card px-2.5 text-sm"
                       value={editForm.kind}
                       onChange={(e) => pickKind(e.target.value, setEditForm, editForm)}
                     >
@@ -460,7 +499,7 @@ export function AiProvidersPanel() {
                       autoComplete="off"
                       value={editForm.api_key}
                       onChange={(e) => setEditForm((f) => ({ ...f, api_key: e.target.value }))}
-                      placeholder={p.has_api_key ? "•••• (giữ nguyên nếu để trống)" : "sk-…"}
+                      placeholder={p.has_api_key ? t("translate.hub.keepKeyPlaceholder") : "sk-…"}
                       className="font-mono text-sm"
                     />
                   </div>
@@ -468,6 +507,7 @@ export function AiProvidersPanel() {
                   <label className="flex items-center gap-2 text-sm sm:col-span-2">
                     <input
                       type="checkbox"
+                      className="size-4 accent-primary"
                       checked={editForm.requires_api_key}
                       onChange={(e) =>
                         setEditForm((f) => ({ ...f, requires_api_key: e.target.checked }))
@@ -476,38 +516,60 @@ export function AiProvidersPanel() {
                     {t("translate.aiProviderRequiresKey")}
                   </label>
                 </div>
-                <div className="flex gap-2">
-                  <Button type="button" size="sm" disabled={busy} onClick={() => handleSaveEdit(p.id)}>
-                    {t("common.save")}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setEditingId(null)}
-                  >
+                <div className="flex justify-end gap-2 border-t border-border pt-3">
+                  <Button type="button" variant="ghost" onClick={() => setEditingId(null)}>
                     {t("common.cancel")}
+                  </Button>
+                  <Button type="button" disabled={busy} onClick={() => handleSaveEdit(p.id)}>
+                    {t("common.save")}
                   </Button>
                 </div>
               </li>
             ) : (
-              <li key={p.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
-                <div className="min-w-0">
+              <li
+                key={p.id}
+                className="flex items-center gap-3 rounded-lg px-2 py-2.5 transition-colors hover:bg-muted/50"
+              >
+                <span
+                  className={cn(
+                    "flex size-9 shrink-0 items-center justify-center rounded-[10px]",
+                    p.kind === "mock" ? "bg-muted text-muted-foreground" : "bg-stage-translate-soft text-stage-translate",
+                  )}
+                >
+                  <Bot className="size-[18px]" aria-hidden />
+                </span>
+                <div className="min-w-0 flex-1">
                   <p className="truncate font-medium">
                     {p.label}
-                    <span className="ml-2 text-xs font-normal text-muted-foreground">{p.kind}</span>
+                    <span className="ml-2 font-mono text-xs font-normal text-muted-foreground">{p.kind}</span>
                   </p>
-                  <p className="truncate text-xs text-muted-foreground">
-                    {p.model || "—"} · {keyStatus(p)}
-                  </p>
+                  <p className="truncate font-mono text-[13px] text-muted-foreground">{p.model || "—"}</p>
                 </div>
-                <div className="flex shrink-0 gap-1">
+                <StatusPill
+                  status={keyTone(p)}
+                  tone={keyTone(p)}
+                  live={false}
+                  label={keyStatus(p)}
+                  className="hidden max-w-[40%] truncate sm:inline-flex"
+                />
+                <KeyRound
+                  className={cn("size-4 shrink-0 sm:hidden", keyTone(p) === "warning" ? "text-warning" : "text-muted-foreground")}
+                  aria-label={keyStatus(p)}
+                />
+                <div className="flex shrink-0 items-center gap-1">
                   <Button type="button" size="sm" variant="outline" onClick={() => startEdit(p)}>
-                    {t("common.edit")}
+                    <Pencil aria-hidden />
+                    <span className="hidden sm:inline">{t("common.edit")}</span>
                   </Button>
-                  <Button type="button" size="sm" variant="ghost" onClick={() => handleDelete(p.id)}>
-                    {t("common.confirmDelete")}
-                  </Button>
+                  <ActionMenu
+                    label={<MoreHorizontal className="size-4" aria-label={t("novel.moreActions")} />}
+                    variant="ghost"
+                    showChevron={false}
+                  >
+                    <ActionMenuItem destructive onSelect={() => void handleDelete(p.id)}>
+                      {t("common.confirmDelete")}
+                    </ActionMenuItem>
+                  </ActionMenu>
                 </div>
               </li>
             ),
@@ -516,12 +578,16 @@ export function AiProvidersPanel() {
       )}
 
       {adding ? (
-        <div className="mt-4 space-y-3 border-t border-border pt-4">
+        <div className="mt-4 space-y-3 rounded-xl border border-primary/40 bg-accent/30 p-4">
+          <p className="flex items-center gap-2 text-[15px] font-semibold">
+            <Plus className="size-4 text-primary" aria-hidden />
+            {t("translate.aiProviderAdd")}
+          </p>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1">
               <Label>{t("translate.aiProviderKind")}</Label>
               <select
-                className="flex h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                className="flex h-9 w-full rounded-lg border border-input bg-card px-2.5 text-sm"
                 value={form.kind}
                 onChange={(e) => pickKind(e.target.value, setForm, form)}
               >
@@ -566,6 +632,7 @@ export function AiProvidersPanel() {
             <label className="flex items-center gap-2 text-sm sm:col-span-2">
               <input
                 type="checkbox"
+                className="size-4 accent-primary"
                 checked={form.requires_api_key}
                 onChange={(e) => setForm((f) => ({ ...f, requires_api_key: e.target.checked }))}
               />
@@ -577,10 +644,7 @@ export function AiProvidersPanel() {
               </p>
             ) : null}
           </div>
-          <div className="flex gap-2">
-            <Button type="button" disabled={busy} onClick={() => void handleAdd()}>
-              {busy ? t("common.saving") : t("common.save")}
-            </Button>
+          <div className="flex justify-end gap-2 border-t border-border pt-3">
             <Button
               type="button"
               variant="ghost"
@@ -591,9 +655,13 @@ export function AiProvidersPanel() {
             >
               {t("common.cancel")}
             </Button>
+            <Button type="button" disabled={busy} onClick={() => void handleAdd()}>
+              {busy ? t("common.saving") : t("common.save")}
+            </Button>
           </div>
         </div>
       ) : null}
+      {confirmDialog}
     </SectionCard>
   )
 }

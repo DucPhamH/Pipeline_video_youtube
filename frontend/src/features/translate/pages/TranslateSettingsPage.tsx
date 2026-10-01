@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react"
-import { Link } from "react-router-dom"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -9,7 +8,11 @@ import { useT } from "@/i18n"
 import { ApiError } from "@/api/client"
 import { translateApi } from "../api"
 import { AiProvidersPanel } from "../components/AiProvidersPanel"
+import { AiUsagePanel } from "@/features/ai/AiUsagePanel"
 import { migrateLegacyProfilesOnce } from "../providerProfiles"
+import { PageSkeleton } from "@/components/Skeleton"
+import { EmptyState } from "@/components/EmptyState"
+import { AlertTriangle, Save } from "lucide-react"
 
 export function TranslateSettingsPage() {
   const t = useT()
@@ -51,7 +54,11 @@ export function TranslateSettingsPage() {
   if (loadError) {
     return (
       <PageShell>
-        <p className="text-sm text-destructive">{loadError}</p>
+        <PageHeader
+          breadcrumbs={[{ label: t("translate.title"), to: "/translate" }, { label: t("translate.settings") }]}
+          title={t("translate.settings")}
+        />
+        <EmptyState icon={AlertTriangle} tone="neutral" title={loadError} />
       </PageShell>
     )
   }
@@ -59,37 +66,49 @@ export function TranslateSettingsPage() {
   if (!ready) {
     return (
       <PageShell>
-        <p className="text-sm text-muted-foreground">{t("app.loading")}</p>
+        <PageSkeleton />
       </PageShell>
     )
   }
 
   return (
-    <PageShell className="gap-6">
+    <PageShell>
       <PageHeader
-        eyebrow={
-          <Link to="/translate" className="text-muted-foreground hover:text-foreground">
-            {t("translate.backLibrary")}
-          </Link>
-        }
+        breadcrumbs={[{ label: t("translate.title"), to: "/translate" }, { label: t("translate.settings") }]}
+        eyebrow={t("translate.hub.eyebrow")}
+        stage="translate"
         title={t("translate.settings")}
         description={t("translate.translateSettingsHint")}
       />
 
       <AiProvidersPanel />
 
+      <AiUsagePanel />
+
       <SectionCard
         title={t("translate.budgetSection")}
         description={t("translate.budgetSectionHint")}
         actions={
-          <Button type="button" disabled={saving} onClick={() => void handleSaveBudget()}>
+          <Button type="button" size="sm" disabled={saving} onClick={() => void handleSaveBudget()}>
+            <Save aria-hidden />
             {saving ? t("common.saving") : t("common.save")}
           </Button>
         }
       >
         <div className="max-w-xs space-y-1.5">
           <Label htmlFor="tr-budget">{t("translate.setBudget")}</Label>
-          <Input id="tr-budget" value={budget} onChange={(e) => setBudget(e.target.value)} className="h-10" />
+          <div className="relative">
+            <span className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 font-mono text-sm text-muted-foreground">
+              $
+            </span>
+            <Input
+              id="tr-budget"
+              inputMode="decimal"
+              value={budget}
+              onChange={(e) => setBudget(e.target.value)}
+              className="h-10 pl-7 font-mono"
+            />
+          </div>
         </div>
       </SectionCard>
     </PageShell>

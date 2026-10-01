@@ -1,24 +1,49 @@
-import { Badge } from "@/components/ui/badge"
+import { StatusPill, type StatusTone } from "@/components/StatusPill"
 import { useT } from "@/i18n"
-import { cn } from "@/lib/utils"
 import type { LifecycleStatus } from "../../../api/types"
 
-const STYLES: Record<LifecycleStatus, string> = {
-  discovered: "bg-sky-500/10 text-sky-700 dark:text-sky-300",
-  crawling: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
-  fully_crawled: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-  translating: "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300",
-  ready_for_video: "bg-teal-500/10 text-teal-700 dark:text-teal-300",
-  produced: "bg-emerald-500/15 text-emerald-800 dark:text-emerald-200",
-  rejected: "bg-muted text-muted-foreground",
-  error: "bg-red-500/10 text-red-700 dark:text-red-300",
+const LIFECYCLE_TONE: Record<LifecycleStatus, StatusTone> = {
+  discovered: "info",
+  crawling: "warning",
+  fully_crawled: "success",
+  translating: "info",
+  ready_for_video: "success",
+  produced: "success",
+  rejected: "neutral",
+  error: "danger",
 }
 
-export function StatusBadge({ status }: { status: LifecycleStatus }) {
+/** Trạng thái vòng đời truyện — luôn qua StatusPill (crawling = chấm nhịp thở). */
+export function StatusBadge({ status, className }: { status: LifecycleStatus; className?: string }) {
   const t = useT()
   return (
-    <Badge variant="outline" className={cn("border-transparent font-medium", STYLES[status])}>
-      {t(`lifecycle.${status}`) || status}
-    </Badge>
+    <StatusPill
+      status={status}
+      label={t(`lifecycle.${status}`) || status}
+      tone={LIFECYCLE_TONE[status] ?? "neutral"}
+      live={status === "crawling"}
+      className={className}
+    />
   )
+}
+
+const CHAPTER_TONE: Record<string, StatusTone> = {
+  pending: "info",
+  crawled: "success",
+  failed: "danger",
+  unsupported: "neutral",
+}
+
+/** Trạng thái 1 chương (pending / crawled / failed / unsupported). */
+export function ChapterStatusPill({ status }: { status: string }) {
+  const t = useT()
+  const label =
+    status === "pending"
+      ? t("novel.statusPending")
+      : status === "crawled"
+        ? t("novel.statusCrawled")
+        : status === "failed"
+          ? t("novel.statusError")
+          : status
+  return <StatusPill status={status} label={label} tone={CHAPTER_TONE[status] ?? "neutral"} live={false} />
 }

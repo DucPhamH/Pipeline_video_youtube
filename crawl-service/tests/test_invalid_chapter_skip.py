@@ -63,7 +63,8 @@ def test_skips_one_invalid_chapter_and_continues(client):  # noqa: ARG001
         assert result.chapters_crawled == 4
 
         chapters = SqlAlchemyChapterRepository(db).list_by_novel(novel.id)
-        assert [c.chapter_index for c in chapters] == [1, 3, 4, 5]
+        assert [c.chapter_index for c in chapters if c.status.value == "crawled"] == [1, 3, 4, 5]
+        assert [c.chapter_index for c in chapters if c.status.value == "failed"] == [2]
 
         novel_final = SqlAlchemyNovelRepository(db).get_by_id(novel.id)
         assert novel_final.lifecycle_status.value == "fully_crawled"
@@ -90,7 +91,8 @@ def test_vip_scrape_errors_do_not_stop_after_three(client):  # noqa: ARG001
         assert result.success is True
         assert result.chapters_crawled == 2
         chapters = SqlAlchemyChapterRepository(db).list_by_novel(novel.id)
-        assert [c.chapter_index for c in chapters] == [1, 5]
+        assert [c.chapter_index for c in chapters if c.status.value == "crawled"] == [1, 5]
+        assert [c.chapter_index for c in chapters if c.status.value == "failed"] == [2, 3, 4]
         novel_final = SqlAlchemyNovelRepository(db).get_by_id(novel.id)
         assert novel_final.lifecycle_status.value == "fully_crawled"
     finally:

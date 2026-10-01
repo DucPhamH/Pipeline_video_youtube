@@ -7,6 +7,7 @@ _TEST_DB = Path(tempfile.gettempdir()) / "translate_service_test.sqlite3"
 if _TEST_DB.exists():
     _TEST_DB.unlink()
 os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB}"
+os.environ["AI_API_BASE_URL"] = ""
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -6,6 +6,7 @@ import re
 
 import httpx
 
+from platform_.auth import outgoing_headers
 from platform_.config import config
 
 logger = logging.getLogger("translate.callback")
@@ -34,7 +35,7 @@ def notify_crawl(*, callback_url: str | None, external_id: str | None, status: s
     payload = {"status": status, "message": message}
     try:
         with httpx.Client(timeout=15.0) as client:
-            r = client.post(url, json=payload)
+            r = client.post(url, json=payload, headers=outgoing_headers())
             if r.status_code >= 400:
                 logger.warning("callback %s → %s %s", url, r.status_code, r.text[:200])
     except Exception as exc:  # noqa: BLE001

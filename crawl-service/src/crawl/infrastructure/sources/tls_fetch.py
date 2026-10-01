@@ -23,7 +23,14 @@ def tls_get(
     proxy: str | None = None,
     source_key: str | None = None,
 ) -> tuple[int, bytes, str]:
-    """GET → (status_code, body_bytes, final_url). Raise ScrapeError nếu thiếu curl_cffi."""
+    """GET → (status_code, body_bytes, final_url). Raise ScrapeError nếu thiếu curl_cffi.
+
+    Chặn URL private (SSRF); cookie chỉ gửi khi host thuộc site `source_key`."""
+    from crawl.infrastructure.sources.fetch_guard import assert_public_url, cookie_allowed_for
+
+    assert_public_url(url)
+    if cookie_header and not cookie_allowed_for(url, source_key):
+        cookie_header = ""
     try:
         from curl_cffi import requests as crequests
     except ImportError as exc:

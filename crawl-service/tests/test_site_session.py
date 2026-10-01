@@ -25,7 +25,10 @@ def test_site_session_api_save_and_read(client):
     assert set(data["cookie_names"]) == {"uid", "token"}
 
     got = client.get("/api/crawl/sites/bqgxs_com/session").json()
-    assert "uid=42" in got["cookie_header"]
+    # Không bao giờ trả giá trị cookie — chỉ cờ + gợi ý (tên, không giá trị).
+    assert "42" not in got["cookie_header"] and "hello" not in str(got)
+    assert got["has_cookie"] is True
+    assert "uid" in got["cookie_hint"]
 
     cleared = client.put("/api/crawl/sites/bqgxs_com/session", json={"cookie_header": ""}).json()
     assert cleared["configured"] is False

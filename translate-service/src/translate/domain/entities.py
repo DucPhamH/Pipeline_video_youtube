@@ -51,6 +51,25 @@ class GlossaryTerm:
     target_term: str
     protected: bool = False
     notes: str = ""
+    kind: str = ""  # character|place|term|other|""
+    # candidate = AI đề xuất qua bảng duyệt tên, CHƯA đưa vào prompt dịch.
+    status: str = "approved"
+
+
+GLOSSARY_KINDS = ("character", "place", "term", "other", "")
+GLOSSARY_STATUSES = ("candidate", "approved")
+
+
+@dataclass
+class SkinMapEntry:
+    """1 dòng bảng đổi vỏ của variant reskin."""
+
+    id: int | None
+    variant_id: int
+    original: str
+    replacement: str
+    kind: str = ""
+    locked: bool = False
 
 
 @dataclass
@@ -87,7 +106,7 @@ class ChapterSource:
 class Variant:
     id: int | None
     work_id: int
-    mode: str  # full | pov | audio_cut | style_clone
+    mode: str  # full | pov | audio_cut | style_clone | reskin
     status: VariantStatus
     lang_tgt: str
     mode_params: dict = field(default_factory=dict)
@@ -165,6 +184,8 @@ class Segment:
     # TRƯỚC (bất kể slot/model nào dịch) để giữ trí nhớ dài hạn, không chỉ
     # đuôi chương ngay trước như prior_context.
     story_state: str = ""
+    # Cảnh báo QA luật rẻ sau khi dịch (xem application/segment_qa.py).
+    qa_flags: list[str] = field(default_factory=list)
 
 
 @dataclass

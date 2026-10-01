@@ -69,6 +69,8 @@ export type Job = {
   ai_mode?: string
   current_slot_index?: number | null
   provider_slots?: JobProviderSlot[]
+  /** Số segment bị QA gắn cờ (backend mới — có thể không có). */
+  flagged_segments?: number
 }
 
 export type ProviderConfig = {
@@ -152,6 +154,8 @@ export type Segment = {
   error: string | null
   output_preview: string
   reviewed: boolean
+  /** Cờ QA — xem QA_FLAGS trong errorText.ts. */
+  qa_flags?: string[]
 }
 
 export type SegmentDetail = {
@@ -163,7 +167,11 @@ export type SegmentDetail = {
   output_text: string | null
   error: string | null
   reviewed: boolean
+  qa_flags?: string[]
 }
+
+export type NameKind = "character" | "place" | "term" | "other" | ""
+export type NameStatus = "candidate" | "approved"
 
 export type GlossaryTerm = {
   id: number
@@ -172,6 +180,78 @@ export type GlossaryTerm = {
   target_term: string
   protected: boolean
   notes: string
+  kind?: NameKind
+  status?: NameStatus
+}
+
+export type GlossaryTermInput = {
+  source_term: string
+  target_term?: string
+  protected?: boolean
+  notes?: string
+  kind?: NameKind
+  status?: NameStatus
+}
+
+export type NameOutputHit = { variant_id: number; mode: string; segments: number }
+
+export type NameItem = {
+  id: number
+  source_term: string
+  target_term: string
+  kind: NameKind
+  status: NameStatus
+  notes: string
+  protected: boolean
+  source_chapter_count: number
+  output_hits: NameOutputHit[]
+}
+
+export type NameExtractResult = { added: number; terms: NameItem[] }
+
+export type RenamePerTerm = {
+  term_id?: number
+  row_id?: number
+  old_target: string
+  new_target: string
+  segments: number
+  replacements: number
+}
+
+export type RenameSample = {
+  segment_id: number
+  variant_id: number
+  chapter_index: number
+  title: string
+  before: string
+  after: string
+}
+
+/** Kết quả POST names/apply và variants/{id}/skin-map/apply (dry_run hoặc thật). */
+export type RenameResult = {
+  batch_id: number | null
+  total_replacements: number
+  per_term: RenamePerTerm[]
+  samples: RenameSample[]
+}
+
+export type RenameBatch = {
+  id: number
+  created_at: string
+  kind: "glossary" | "skin_map"
+  variant_id: number | null
+  changes: { old: string; new: string }[]
+  segments: number
+}
+
+export type UndoResult = { restored: number; skipped: number }
+
+export type SkinMapRow = {
+  id: number
+  original: string
+  replacement: string
+  kind: string
+  locked: boolean
 }
 
 export type Estimate = {

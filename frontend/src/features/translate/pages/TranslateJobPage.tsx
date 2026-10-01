@@ -1,23 +1,55 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Link, useNavigate, useParams } from "react-router-dom"
+import { useNavigate, useParams } from "react-router-dom"
 import { toast } from "sonner"
+import { Cpu, Download, Headphones, MoreHorizontal, Pause, Play } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Textarea } from "@/components/ui/textarea"
-import { PageHeader, PageShell, SectionCard, SegmentedTabs } from "@/components/PageChrome"
+import { PageHeader, PageShell } from "@/components/PageChrome"
+import { ActionMenu, ActionMenuItem } from "@/components/ActionMenu"
 import { useT } from "@/i18n"
 import { ApiError } from "@/api/client"
-import { cn } from "@/lib/utils"
 import { translateApi } from "../api"
-import { TranslateStatusBadge } from "../components/TranslateStatusBadge"
+import { ttsApi } from "@/features/tts/api"
 import { jobCanDelete, jobCanResume, jobIsActive, useJobActions } from "../hooks/useJobActions"
+import { useJobPoll } from "../hooks/useJobPoll"
+import { useModeLabel } from "../components/ModeParamsFields"
+import { useConfirm } from "@/components/useConfirm"
 import { getCatalogEntry } from "../providerProfiles"
+import { friendlyError, qaFlagLabel } from "../errorText"
 import type { AiProvider, Job, Segment, SegmentDetail, Variant, Work } from "../types"
+import { PageSkeleton } from "@/components/Skeleton"
+import { JobStatusStrip } from "../job/JobStatusStrip"
+import { SegmentList } from "../job/SegmentList"
+import { ReviewPane } from "../job/ReviewPane"
+import { SwitchAiDialog } from "../job/SwitchAiDialog"
+import { countByFilter, segmentMatches, type SegFilter } from "../job/segmentFilter"
 
-type SegFilter = "all" | "pending" | "done" | "failed" | "reviewed"
-const PAGE_SIZE = 40
 const QUOTA_ERROR_RE = /429|quota|rate.?limit|insufficient/i
+/** Số lần poll lỗi liên tiếp trước khi hiện "mất kết nối". */
+const POLL_FAIL_WARN = 3
+/** Số request getSegment song song khi gom chương gửi sang TTS. */
+const TTS_FETCH_CONCURRENCY = 5
+
+/** map async với giới hạn số request song song, giữ nguyên thứ tự kết quả. */
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length)
+  let next = 0
+  async function worker() {
+    while (next < items.length) {
+      const i = next++
+      out[i] = await fn(items[i])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
+}
+
+/** Đang gõ trong ô nhập → bỏ qua phím tắt điều hướng. */
+function isTypingTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false
+  if (el.isContentEditable) return true
+  const tag = el.tagName
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT"
+}
 
 export function TranslateJobPage() {
   const t = useT()
@@ -26,6 +58,8 @@ export function TranslateJobPage() {
   const wId = Number(workId)
   const jId = Number(jobId)
   const actions = useJobActions()
+  const modeLabel = useModeLabel()
+  const [confirm, confirmDialog] = useConfirm()
 
   const [work, setWork] = useState<Work | null>(null)
   const [variant, setVariant] = useState<Variant | null>(null)
@@ -35,14 +69,26 @@ export function TranslateJobPage() {
   const [editOut, setEditOut] = useState("")
   const [loadError, setLoadError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [exporting, setExporting] = useState<string | null>(null)
+  /** Tăng mỗi khi job được set từ nguồn khác (action/poll) — response poll cũ hơn bị bỏ. */
+  const jobSeqRef = useRef(0)
+  const openSegSeqRef = useRef(0)
 
   const [providers, setProviders] = useState<AiProvider[]>([])
   const [switchAiId, setSwitchAiId] = useState<number | null>(null)
   const [switchModel, setSwitchModel] = useState("")
+  const [switchOpen, setSwitchOpen] = useState(false)
 
   const [segFilter, setSegFilter] = useState<SegFilter>("all")
   const [segSearch, setSegSearch] = useState("")
-  const [segPage, setSegPage] = useState(0)
+  /** Lọc "Cờ QA" theo 1 cờ cụ thể ("" = mọi cờ). */
+  const [qaFlag, setQaFlag] = useState("")
+
+  const applyJob = useCallback((j: Job) => {
+    jobSeqRef.current += 1
+    setJob(j)
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -63,19 +109,12 @@ export function TranslateJobPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wId, jId])
 
-  useEffect(() => {
-    if (!job || !jobIsActive(job)) return
-    const timer = setInterval(async () => {
-      try {
-        const j = await translateApi.getJob(job.id)
-        setJob(j)
-        setSegments(await translateApi.listSegments(j.id))
-      } catch {
-        /* ignore poll errors */
-      }
-    }, 1200)
-    return () => clearInterval(timer)
-  }, [job])
+  const onPollData = useCallback((j: Job, segs: Segment[]) => {
+    setJob(j)
+    setSegments(segs)
+  }, [])
+  const active = jobIsActive(job)
+  const pollFailures = useJobPoll({ jobId: job?.id, active, seqRef: jobSeqRef, onData: onPollData })
 
   const lastToastRef = useRef<{ id: number; status: string }>({ id: 0, status: "" })
   useEffect(() => {
@@ -86,73 +125,72 @@ export function TranslateJobPage() {
     lastToastRef.current = { id: job.id, status: job.status }
     if (!prevStatus || prevStatus === job.status) return
     if (job.status === "completed") toast.success(t("translate.jobDone"))
-    else if (job.status === "failed") toast.error(job.error || t("translate.jobFailed"))
+    else if (job.status === "failed") toast.error(friendlyError(job.error, t) || t("translate.jobFailed"))
     else if (job.status === "cancelled") toast.message(t("translate.jobStopped"))
     else if (job.status === "running") toast.message(t("translate.jobRunning"))
   }, [job, t])
 
-  useEffect(() => {
-    setSegPage(0)
-  }, [segFilter, segSearch])
+  /** Mọi cờ QA đang có trong danh sách segment (để dựng bộ lọc). */
+  const qaFlagsPresent = useMemo(() => {
+    const set = new Set<string>()
+    for (const s of segments) for (const f of s.qa_flags ?? []) set.add(f)
+    return [...set].sort()
+  }, [segments])
+
+  const counts = useMemo(() => countByFilter(segments), [segments])
+
+  const chapterTitles = useMemo(() => {
+    const m = new Map<number, string>()
+    for (const c of work?.chapters ?? []) if (c.title) m.set(c.index, c.title)
+    return m
+  }, [work])
+  const titleFor = useCallback(
+    (index: number) => chapterTitles.get(index) || t("translate.chapterTitleFallback", { index }),
+    [chapterTitles, t],
+  )
 
   const filteredSegments = useMemo(() => {
     const q = segSearch.trim().toLowerCase()
     return segments.filter((s) => {
-      if (segFilter === "pending" && !["pending", "queued"].includes(s.status)) return false
-      if (segFilter === "done" && !["done", "skipped_cache"].includes(s.status)) return false
-      if (segFilter === "failed" && s.status !== "failed") return false
-      if (segFilter === "reviewed" && !s.reviewed) return false
+      if (!segmentMatches(s, segFilter, qaFlag)) return false
       if (q) {
-        const blob = `#${s.chapter_index} ${s.status} ${s.output_preview} ${s.error ?? ""}`.toLowerCase()
+        const flags = (s.qa_flags ?? []).map((f) => qaFlagLabel(f, t)).join(" ")
+        const blob =
+          `#${s.chapter_index} ${chapterTitles.get(s.chapter_index) ?? ""} ${s.status} ${flags} ${s.output_preview} ${s.error ?? ""}`.toLowerCase()
         if (!blob.includes(q)) return false
       }
       return true
     })
-  }, [segments, segFilter, segSearch])
+  }, [segments, segFilter, segSearch, qaFlag, chapterTitles, t])
 
-  const pageCount = Math.max(1, Math.ceil(filteredSegments.length / PAGE_SIZE))
-  const pageSafe = Math.min(segPage, pageCount - 1)
-  const pageItems = filteredSegments.slice(pageSafe * PAGE_SIZE, pageSafe * PAGE_SIZE + PAGE_SIZE)
-
-  const progressPct = job && job.total_segments > 0 ? Math.round((job.done_segments / job.total_segments) * 100) : 0
-  const active = jobIsActive(job)
   const canResume = jobCanResume(job)
   const canDelete = jobCanDelete(job)
   const looksLikeQuotaError = Boolean(job?.error && QUOTA_ERROR_RE.test(job.error))
-  const isMultiAi = (job?.provider_slots?.length ?? 0) >= 2
-  const isFallback = isMultiAi && job?.ai_mode === "fallback"
-
-  function jobStatusLabel(status: string) {
-    if (status === "queued") return t("translate.statusQueued")
-    if (status === "running") return t("translate.statusRunning")
-    if (status === "completed") return t("translate.statusCompleted")
-    if (status === "failed") return t("translate.statusFailed")
-    if (status === "cancelled") return t("translate.statusCancelled")
-    return status
-  }
-
-  function segmentStatusLabel(status: string) {
-    if (status === "pending" || status === "queued") return t("translate.filterPending")
-    if (status === "done" || status === "skipped_cache") return t("translate.filterDone")
-    if (status === "failed") return t("translate.filterFailed")
-    return status
-  }
+  const flaggedCount = job?.flagged_segments ?? counts.flagged
+  const canExport = job?.status === "completed" || variant?.status === "ready"
 
   async function handlePause() {
     if (!job) return
     setBusy(true)
-    const j = await actions.pause(job.id)
-    if (j) {
-      setJob(j)
-      setSegments(await translateApi.listSegments(j.id))
+    try {
+      const j = await actions.pause(job.id)
+      if (j) {
+        applyJob(j)
+        setSegments(await translateApi.listSegments(j.id))
+      }
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
+    } finally {
+      setBusy(false)
     }
-    setBusy(false)
   }
 
+  const jobModelId = job?.id
+  const jobModel = job?.model
   useEffect(() => {
-    if (!job) return
-    setSwitchModel(job.model || "")
-  }, [job?.id, job?.model])
+    if (jobModelId == null) return
+    setSwitchModel(jobModel || "")
+  }, [jobModelId, jobModel])
 
   const switchTarget =
     switchAiId != null
@@ -181,7 +219,10 @@ export function TranslateJobPage() {
           }
         : undefined
     const j = await actions.resume(job.id, cfg)
-    if (j) setJob(j)
+    if (j) {
+      applyJob(j)
+      setSwitchOpen(false)
+    }
     setBusy(false)
   }
 
@@ -194,39 +235,121 @@ export function TranslateJobPage() {
       ai_provider_id: switchAiId ?? job.ai_provider_id ?? undefined,
       ...(model ? { model } : {}),
     })
-    if (j) setJob(j)
+    if (j) {
+      applyJob(j)
+      setSwitchOpen(false)
+    }
     setBusy(false)
   }
 
   async function handleDelete() {
     if (!job) return
-    const ok = await actions.remove(job.id, t("translate.deleteJobConfirm"))
-    if (ok) navigate(`/translate/${wId}`)
-  }
-
-  async function handleExport() {
-    if (!variant) return
+    const confirmed = await confirm({
+      title: t("common.deleteTitle"),
+      description: t("translate.deleteJobConfirm"),
+      confirmLabel: t("translate.deleteJob"),
+    })
+    if (!confirmed) return
+    setBusy(true)
     try {
-      await translateApi.exportTxt(variant.id)
-      toast.success(t("translate.exportOk"))
-    } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
+      const ok = await actions.remove(job.id)
+      if (ok) navigate(`/translate/${wId}`)
+    } finally {
+      setBusy(false)
     }
   }
 
-  async function handleExportJson() {
-    if (!variant) return
+  /** `flagOverride` = undefined → dùng bộ lọc cờ hiện tại (nếu đang lọc "Cờ QA"). */
+  async function handleRetranslateFlagged(flagOverride?: string) {
+    if (!job) return
+    const flag = flagOverride ?? (segFilter === "flagged" ? qaFlag : "")
+    const confirmed = await confirm({
+      title: t("translate.retranslateFlaggedTitle"),
+      description: flag
+        ? t("translate.retranslateFlaggedConfirmOne", { flag: qaFlagLabel(flag, t) })
+        : t("translate.retranslateFlaggedConfirm", { count: flaggedCount }),
+      confirmLabel: t("translate.retranslateFlagged"),
+      destructive: false,
+    })
+    if (!confirmed) return
+    setBusy(true)
     try {
-      await translateApi.exportJson(variant.id)
+      const j = await translateApi.retranslateFlagged(job.id, flag || undefined)
+      applyJob(j)
+      setSegments(await translateApi.listSegments(j.id))
+      toast.success(t("translate.jobResumed"))
+    } catch (err) {
+      toast.error(err instanceof ApiError ? friendlyError(err.message, t) : t("app.unknownError"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Chặn bấm export 2 lần khi file đang tải. */
+  async function runExport(kind: string, fn: (variantId: number) => Promise<void>) {
+    if (!variant || exporting) return
+    setExporting(kind)
+    try {
+      await fn(variant.id)
       toast.success(t("translate.exportOk"))
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
+    } finally {
+      setExporting(null)
     }
+  }
+
+  async function handleSendTts() {
+    if (!work || !variant || !job) return
+    setBusy(true)
+    try {
+      const details = await mapLimit(segments, TTS_FETCH_CONCURRENCY, (s) => translateApi.getSegment(s.id))
+      const chapters = details
+        .filter((d) => (d.output_text || "").trim())
+        .map((d) => ({
+          index: d.chapter_index,
+          title: titleFor(d.chapter_index),
+          text: d.output_text || "",
+        }))
+      if (chapters.length === 0) {
+        toast.error(t("tts.needChapters"))
+        return
+      }
+      const created = await ttsApi.fromTranslate({
+        title: work.title,
+        author: work.author,
+        lang: variant.lang_tgt,
+        external_id: `translate:variant:${variant.id}`,
+        chapters,
+      })
+      toast.success(created.created ? t("tts.sent") : t("tts.alreadyThere"))
+      navigate(`/tts/${created.id}`)
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const reviewDirty = activeSeg != null && editOut !== (activeSeg.output_text ?? "")
+
+  /** true = được phép rời bản đang sửa (không có thay đổi, hoặc user đồng ý bỏ). */
+  async function confirmDiscardEdits(): Promise<boolean> {
+    if (!reviewDirty) return true
+    return confirm({
+      title: t("translate.discardEditsTitle"),
+      description: t("translate.discardEditsConfirm"),
+      confirmLabel: t("translate.discardEdits"),
+    })
   }
 
   async function openSegment(segId: number) {
+    if (activeSeg?.id === segId) return
+    if (!(await confirmDiscardEdits())) return
+    const seq = ++openSegSeqRef.current
     try {
       const d = await translateApi.getSegment(segId)
+      if (seq !== openSegSeqRef.current) return
       setActiveSeg(d)
       setEditOut(d.output_text ?? "")
     } catch (err) {
@@ -234,9 +357,15 @@ export function TranslateJobPage() {
     }
   }
 
+  async function closeSegment() {
+    if (!(await confirmDiscardEdits())) return
+    openSegSeqRef.current += 1
+    setActiveSeg(null)
+  }
+
   async function saveSegment() {
-    if (!activeSeg) return
-    setBusy(true)
+    if (!activeSeg || saving) return
+    setSaving(true)
     try {
       const d = await translateApi.putSegment(activeSeg.id, { output_text: editOut, reviewed: true })
       setActiveSeg(d)
@@ -251,16 +380,47 @@ export function TranslateJobPage() {
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
     } finally {
-      setBusy(false)
+      setSaving(false)
     }
   }
 
+  const activeIdx = activeSeg ? filteredSegments.findIndex((s) => s.id === activeSeg.id) : -1
+
   async function jumpAdjacent(delta: number) {
-    if (!activeSeg || filteredSegments.length === 0) return
-    const idx = filteredSegments.findIndex((s) => s.id === activeSeg.id)
-    const next = filteredSegments[idx < 0 ? 0 : idx + delta]
+    if (filteredSegments.length === 0) return
+    const next = activeIdx < 0 ? filteredSegments[0] : filteredSegments[activeIdx + delta]
     if (next) await openSegment(next.id)
   }
+
+  // Phím tắt (chỉ trong trang này): j/k hoặc ↑/↓ chuyển chương khi không gõ; Ctrl/⌘+S lưu.
+  const keyHandlersRef = useRef({ jump: jumpAdjacent, save: saveSegment, hasSeg: false })
+  useEffect(() => {
+    keyHandlersRef.current = { jump: jumpAdjacent, save: saveSegment, hasSeg: activeSeg != null }
+  })
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return
+      // Có dialog đang mở (xác nhận, đổi AI…) → không can thiệp.
+      if (document.querySelector('[data-slot="dialog-content"]')) return
+      const h = keyHandlersRef.current
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "s") {
+        if (!h.hasSeg) return
+        e.preventDefault()
+        void h.save()
+        return
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return
+      if (e.key === "j" || e.key === "ArrowDown") {
+        e.preventDefault()
+        void h.jump(1)
+      } else if (e.key === "k" || e.key === "ArrowUp") {
+        e.preventDefault()
+        void h.jump(-1)
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [])
 
   if (loadError) {
     return (
@@ -273,326 +433,187 @@ export function TranslateJobPage() {
   if (!work || !job) {
     return (
       <PageShell>
-        <p className="text-sm text-muted-foreground">{t("app.loading")}</p>
+        <PageSkeleton />
       </PageShell>
     )
   }
 
-  return (
-    <PageShell className="gap-4 space-y-4">
-      <div className="sticky top-14 z-30 -mx-4 border-b border-border bg-background/95 px-4 py-3 backdrop-blur-sm sm:-mx-6 sm:px-6 lg:-mx-8 lg:px-8">
-        <PageHeader
-          className="gap-3"
-          eyebrow={
-            <Link to={`/translate/${wId}`} className="text-muted-foreground hover:text-foreground">
-              ← {work.title}
-            </Link>
-          }
-          title={t("translate.jobDetailTitle", { id: String(job.id) })}
-          description={variant ? `${variant.mode} · ${variant.lang_tgt} · ${job.model}` : job.model}
-        />
+  const isCompleted = job.status === "completed"
+  const primary: "pause" | "send" | "resume" | null = active
+    ? "pause"
+    : isCompleted
+      ? "send"
+      : canResume
+        ? "resume"
+        : null
 
-        <div className="mt-3 space-y-2 rounded-md border border-border bg-muted/40 px-3 py-2.5">
-          <div className="flex flex-wrap items-start justify-between gap-2">
-            <div className="min-w-0 space-y-0.5">
-              <p className="flex items-center gap-1.5 text-sm font-medium">
-                <TranslateStatusBadge status={job.status} label={jobStatusLabel(job.status)} />
-                <span className="font-normal text-muted-foreground">
-                  {job.done_segments}/{job.total_segments} {t("translate.chaptersShort")}
-                  {job.failed_segments ? ` · ${job.failed_segments} ${t("translate.failShort")}` : ""}
-                </span>
-              </p>
-            </div>
-            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">{progressPct}%</span>
-          </div>
-          <div className="h-1.5 overflow-hidden rounded-full bg-background">
-            <div
-              className={cn(
-                "h-full rounded-full transition-[width] duration-300",
-                job.status === "failed" ? "bg-destructive" : job.status === "cancelled" ? "bg-amber-500" : "bg-primary",
-              )}
-              style={{ width: `${progressPct}%` }}
-            />
-          </div>
-          {job.error ? <p className="text-xs text-destructive">{job.error}</p> : null}
-        </div>
+  const primaryAction =
+    primary === "pause" ? (
+      <Button type="button" disabled={busy} onClick={() => void handlePause()}>
+        <Pause aria-hidden />
+        {t("translate.pauseJob")}
+      </Button>
+    ) : primary === "send" ? (
+      <Button type="button" disabled={busy} onClick={() => void handleSendTts()}>
+        <Headphones aria-hidden />
+        {t("translate.job.sendToListen")}
+      </Button>
+    ) : primary === "resume" ? (
+      <Button type="button" disabled={busy} onClick={() => void handleResume()}>
+        <Play aria-hidden />
+        {t("translate.resume")}
+      </Button>
+    ) : null
 
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <Button type="button" variant="outline" disabled={busy || !active} onClick={() => void handlePause()}>
-            {t("translate.pauseJob")}
-          </Button>
-          <Button type="button" variant="outline" disabled={busy || !canResume} onClick={() => void handleResume()}>
+  const secondaryActions = (
+    <>
+      <Button type="button" variant="outline" size="sm" onClick={() => setSwitchOpen(true)}>
+        <Cpu aria-hidden />
+        {t("translate.job.switchAi")}
+      </Button>
+      <ActionMenu
+        label={
+          <>
+            <Download aria-hidden />
+            {exporting ? t("translate.job.exporting") : t("translate.job.export")}
+          </>
+        }
+        disabled={exporting != null || !canExport}
+      >
+        <ActionMenuItem onSelect={() => void runExport("txt", translateApi.exportTxt)}>TXT</ActionMenuItem>
+        <ActionMenuItem onSelect={() => void runExport("json", translateApi.exportJson)}>JSON</ActionMenuItem>
+        <ActionMenuItem onSelect={() => void runExport("epub", (id) => translateApi.exportEpub(id))}>EPUB</ActionMenuItem>
+        <ActionMenuItem onSelect={() => void runExport("epub-bilingual", (id) => translateApi.exportEpub(id, true))}>
+          {t("translate.exportBilingual")}
+        </ActionMenuItem>
+      </ActionMenu>
+      <ActionMenu
+        label={
+          <>
+            <MoreHorizontal aria-hidden />
+            <span className="sr-only">{t("translate.job.more")}</span>
+          </>
+        }
+        showChevron={false}
+      >
+        {primary !== "resume" ? (
+          <ActionMenuItem disabled={busy || !canResume} onSelect={() => void handleResume()}>
             {t("translate.resume")}
-          </Button>
-          <Button type="button" variant="outline" disabled={busy || !canDelete} onClick={() => void handleDelete()}>
-            {t("translate.deleteJob")}
-          </Button>
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={!(job.status === "completed" || variant?.status === "ready")}
-              onClick={() => void handleExport()}
-            >
-              TXT
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={!(job.status === "completed" || variant?.status === "ready")}
-              onClick={() => void handleExportJson()}
-            >
-              JSON
-            </Button>
-          </div>
-        </div>
-
-        {looksLikeQuotaError ? (
-          <p className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-            {t("translate.quotaErrorBanner")}
-          </p>
+          </ActionMenuItem>
         ) : null}
+        {primary !== "send" ? (
+          <ActionMenuItem disabled={busy || !isCompleted} onSelect={() => void handleSendTts()}>
+            {t("translate.job.sendToListen")}
+          </ActionMenuItem>
+        ) : null}
+        <ActionMenuItem destructive disabled={busy || !canDelete} onSelect={() => void handleDelete()}>
+          {t("translate.deleteJob")}
+        </ActionMenuItem>
+      </ActionMenu>
+    </>
+  )
 
-        {isMultiAi ? (
-          <div className="mt-3 space-y-1 border-t border-border pt-3">
-            <p className="text-xs font-medium text-muted-foreground">
-              {t(isFallback ? "translate.fallbackJobLabel" : "translate.poolJobLabel")}
-            </p>
-            <ul className="flex flex-wrap gap-1.5">
-              {job.provider_slots!.map((s) => {
-                const isActive = isFallback && s.slot_index === job.current_slot_index
-                return (
-                  <li
-                    key={s.slot_index}
-                    className={cn(
-                      "rounded-md border px-2 py-1 text-xs",
-                      isActive
-                        ? "border-emerald-500/40 bg-emerald-500/10 font-medium text-emerald-700 dark:text-emerald-300"
-                        : "border-border bg-muted/40",
-                    )}
-                  >
-                    {s.label || s.model}
-                    {s.requires_api_key && !s.has_api_key ? ` — ${t("translate.noKey")}` : ""}
-                  </li>
-                )
-              })}
-            </ul>
-            <p className="text-xs text-muted-foreground">
-              {t(isFallback ? "translate.fallbackNoSwitchHint" : "translate.poolNoSwitchHint")}
-            </p>
-          </div>
-        ) : (
-        <div className="mt-3 flex flex-wrap items-end gap-2 border-t border-border pt-3">
-          <label className="flex min-w-0 flex-1 flex-col gap-1 sm:max-w-xs">
-            <span className="text-xs font-medium text-muted-foreground">{t("translate.switchAi")}</span>
-            <select
-              className="h-9 w-full rounded-md border border-input bg-background px-2.5 text-sm"
-              value={switchAiId ?? ""}
-              onChange={(e) => {
-                const id = e.target.value ? Number(e.target.value) : null
-                setSwitchAiId(id)
-                if (id != null) {
-                  const p = providers.find((x) => x.id === id)
-                  if (p) setSwitchModel(p.model)
-                } else if (job) {
-                  setSwitchModel(job.model || "")
-                }
-              }}
-            >
-              <option value="">{t("translate.switchAiKeep")}</option>
-              {[...providers]
-                .sort((a, b) => Number(a.kind === "mock") - Number(b.kind === "mock"))
-                .map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.label}
-                    {p.kind === "mock" ? ` ${t("translate.mockSuffix")}` : ""}
-                    {p.requires_api_key && !p.has_api_key ? ` — ${t("translate.noKey")}` : ""}
-                  </option>
-                ))}
-            </select>
-          </label>
-          <label className="flex min-w-0 flex-1 flex-col gap-1 sm:max-w-xs">
-            <span className="text-xs font-medium text-muted-foreground">{t("translate.jobModel")}</span>
-            <select
-              className="h-9 w-full rounded-md border border-input bg-background px-2.5 font-mono text-xs"
-              value={switchModelOptions.includes(switchModel) ? switchModel : "__custom__"}
-              onChange={(e) => {
-                const v = e.target.value
-                if (v === "__custom__") setSwitchModel("")
-                else setSwitchModel(v)
-              }}
-            >
-              {switchModelOptions.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-              <option value="__custom__">{t("settings.customModel")}</option>
-            </select>
-          </label>
-          {!switchModelOptions.includes(switchModel) || switchModel === "" ? (
-            <Input
-              value={switchModel}
-              onChange={(e) => setSwitchModel(e.target.value)}
-              className="h-9 max-w-xs font-mono text-xs"
-              placeholder="model-id"
-            />
-          ) : null}
-          <Button
-            type="button"
-            variant="secondary"
-            disabled={
-              busy ||
-              !active ||
-              (switchAiId == null && (!switchModel.trim() || switchModel.trim() === job.model))
-            }
-            onClick={() => void handleApplyAiMidRun()}
-          >
-            {t("translate.applyAiMidRun")}
-          </Button>
-          <p className="basis-full text-xs text-muted-foreground">{t("translate.switchAiHint")}</p>
+  const langSrc = work.lang_src
+  const langTgt = variant?.lang_tgt ?? work.lang_tgt
+
+  return (
+    <PageShell className="space-y-4">
+      <PageHeader
+        breadcrumbs={[
+          { label: t("translate.job.crumbTranslate"), to: "/translate" },
+          { label: work.title, to: `/translate/${wId}` },
+          { label: t("translate.job.title", { id: job.id }) },
+        ]}
+        eyebrow={t("translate.job.eyebrow")}
+        stage="translate"
+        title={work.title}
+        meta={
+          <>
+            {variant ? <span>{modeLabel(variant.mode)}</span> : null}
+            <span className="font-mono text-[13px] uppercase">
+              {langSrc} → {langTgt}
+            </span>
+            <span className="font-mono text-[13px]">{t("translate.job.title", { id: job.id })}</span>
+          </>
+        }
+        secondaryActions={secondaryActions}
+        primaryAction={primaryAction}
+      />
+
+      <JobStatusStrip
+        job={job}
+        active={active}
+        flaggedCount={flaggedCount}
+        connectionLost={active && pollFailures >= POLL_FAIL_WARN}
+        quotaError={looksLikeQuotaError}
+        busy={busy}
+        onRetranslateFlagged={() => void handleRetranslateFlagged()}
+        onShowFlagged={() => setSegFilter("flagged")}
+      />
+
+      <section
+        aria-label={t("translate.job.workspaceLabel")}
+        className="flex flex-col overflow-hidden rounded-2xl border border-border bg-card lg:h-[calc(100dvh-8.5rem)] lg:min-h-[34rem] lg:flex-row"
+      >
+        <div className="flex h-[24rem] shrink-0 flex-col border-b border-border bg-muted/40 lg:h-auto lg:w-[340px] lg:border-r lg:border-b-0">
+          <SegmentList
+            segments={filteredSegments}
+            totalCount={segments.length}
+            activeId={activeSeg?.id ?? null}
+            onOpen={(id) => void openSegment(id)}
+            titleFor={titleFor}
+            search={segSearch}
+            onSearch={setSegSearch}
+            filter={segFilter}
+            onFilter={setSegFilter}
+            counts={counts}
+            qaFlags={qaFlagsPresent}
+            qaFlag={qaFlag}
+            onQaFlag={setQaFlag}
+          />
+          <p className="hidden border-t border-border px-4 py-2 text-[11px] text-muted-foreground lg:block">
+            {t("translate.job.shortcuts")}
+          </p>
         </div>
-        )}
-      </div>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <ReviewPane
+            segment={activeSeg}
+            title={activeSeg ? titleFor(activeSeg.chapter_index) : ""}
+            langSrc={langSrc}
+            langTgt={langTgt}
+            value={editOut}
+            onChange={setEditOut}
+            dirty={reviewDirty}
+            saving={saving}
+            onSave={() => void saveSegment()}
+            onPrev={() => void jumpAdjacent(-1)}
+            onNext={() => void jumpAdjacent(1)}
+            hasPrev={activeIdx > 0}
+            hasNext={filteredSegments.length > 0 && activeIdx < filteredSegments.length - 1}
+            onClose={() => void closeSegment()}
+            onRetranslateFlagged={(flag) => void handleRetranslateFlagged(flag ?? "")}
+            retranslateDisabled={busy || active}
+          />
+        </div>
+      </section>
 
-      <div className="grid min-h-[28rem] gap-4 lg:grid-cols-[minmax(16rem,22rem)_minmax(0,1fr)] lg:items-stretch">
-        <SectionCard
-          title={t("translate.segments")}
-          description={t("translate.segmentsListHint", { shown: pageItems.length, total: filteredSegments.length })}
-        >
-          <div className="mb-3 flex flex-col gap-2">
-            <Input
-              value={segSearch}
-              onChange={(e) => setSegSearch(e.target.value)}
-              placeholder={t("translate.segmentSearch")}
-              className="h-8"
-            />
-            <SegmentedTabs
-              value={segFilter}
-              onChange={setSegFilter}
-              className="w-full"
-              items={[
-                { value: "all", label: t("translate.filterAll") },
-                { value: "pending", label: t("translate.filterPending") },
-                { value: "done", label: t("translate.filterDone") },
-                { value: "failed", label: t("translate.filterFailed") },
-                { value: "reviewed", label: t("translate.filterReviewed") },
-              ]}
-            />
-          </div>
-
-          {segments.length === 0 ? (
-            <p className="text-sm text-muted-foreground">{t("translate.segmentsEmpty")}</p>
-          ) : pageItems.length === 0 ? (
-            <p className="text-sm text-muted-foreground">{t("translate.segmentsFilterEmpty")}</p>
-          ) : (
-            <ul className="max-h-[min(60vh,32rem)] divide-y divide-border overflow-y-auto lg:max-h-[calc(100vh-22rem)]">
-              {pageItems.map((s) => {
-                const isActive = activeSeg?.id === s.id
-                return (
-                  <li key={s.id}>
-                    <button
-                      type="button"
-                      className={cn(
-                        "flex w-full flex-col gap-0.5 px-1 py-2 text-left text-sm transition-colors",
-                        isActive ? "bg-muted text-foreground" : "hover:bg-muted/60",
-                      )}
-                      onClick={() => openSegment(s.id)}
-                    >
-                      <span className="flex items-center justify-between gap-2">
-                        <span className="font-medium">#{s.chapter_index}</span>
-                        <span className="flex shrink-0 items-center gap-1.5">
-                          <TranslateStatusBadge status={s.status} label={segmentStatusLabel(s.status)} />
-                          {s.reviewed ? (
-                            <span className="text-xs text-muted-foreground">{t("translate.reviewed")}</span>
-                          ) : null}
-                        </span>
-                      </span>
-                      {s.status === "failed" && s.error ? (
-                        <span className="line-clamp-2 text-xs text-destructive">{s.error}</span>
-                      ) : s.output_preview ? (
-                        <span className="line-clamp-1 text-xs text-muted-foreground">{s.output_preview}</span>
-                      ) : null}
-                    </button>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-
-          {filteredSegments.length > PAGE_SIZE ? (
-            <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3 text-xs">
-              <Button type="button" variant="outline" size="sm" disabled={pageSafe <= 0} onClick={() => setSegPage((p) => Math.max(0, p - 1))}>
-                {t("common.prev")}
-              </Button>
-              <span className="text-muted-foreground">
-                {pageSafe + 1}/{pageCount}
-              </span>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={pageSafe >= pageCount - 1}
-                onClick={() => setSegPage((p) => Math.min(pageCount - 1, p + 1))}
-              >
-                {t("common.next")}
-              </Button>
-            </div>
-          ) : null}
-        </SectionCard>
-
-        <SectionCard
-          title={activeSeg ? t("translate.reviewTitle", { index: activeSeg.chapter_index }) : t("translate.reviewPick")}
-          description={activeSeg ? t("translate.reviewHint") : t("translate.reviewPickHint")}
-          actions={
-            activeSeg ? (
-              <div className="flex gap-1">
-                <Button type="button" variant="ghost" size="sm" onClick={() => jumpAdjacent(-1)}>
-                  {t("common.prev")}
-                </Button>
-                <Button type="button" variant="ghost" size="sm" onClick={() => jumpAdjacent(1)}>
-                  {t("common.next")}
-                </Button>
-              </div>
-            ) : null
-          }
-        >
-          {!activeSeg ? (
-            <p className="text-sm text-muted-foreground">{t("translate.reviewPickHint")}</p>
-          ) : (
-            <>
-              {activeSeg.error ? <p className="mb-3 text-xs text-destructive">{activeSeg.error}</p> : null}
-              <div className="grid gap-4 xl:grid-cols-2">
-                <div className="space-y-1.5">
-                  <Label>{t("translate.source")}</Label>
-                  <pre className="h-[min(55vh,32rem)] overflow-y-auto whitespace-pre-wrap rounded-lg border border-border bg-muted/40 p-3 text-xs leading-relaxed">
-                    {activeSeg.source_text}
-                  </pre>
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="seg-out">{t("translate.output")}</Label>
-                  <Textarea
-                    id="seg-out"
-                    value={editOut}
-                    onChange={(e) => setEditOut(e.target.value)}
-                    className="h-[min(55vh,32rem)] resize-none overflow-y-auto font-mono text-xs [field-sizing:fixed]"
-                  />
-                </div>
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Button type="button" disabled={busy} onClick={saveSegment}>
-                  {busy ? t("common.saving") : t("translate.saveReview")}
-                </Button>
-                <Button type="button" variant="ghost" onClick={() => setActiveSeg(null)}>
-                  {t("common.close")}
-                </Button>
-              </div>
-            </>
-          )}
-        </SectionCard>
-      </div>
+      <SwitchAiDialog
+        open={switchOpen}
+        onOpenChange={setSwitchOpen}
+        job={job}
+        providers={providers}
+        switchAiId={switchAiId}
+        onSwitchAiId={setSwitchAiId}
+        switchModel={switchModel}
+        onSwitchModel={setSwitchModel}
+        modelOptions={switchModelOptions}
+        busy={busy}
+        active={active}
+        canResume={canResume}
+        onApply={() => void handleApplyAiMidRun()}
+        onResume={() => void handleResume()}
+      />
+      {confirmDialog}
     </PageShell>
   )
 }

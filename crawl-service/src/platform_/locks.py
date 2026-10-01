@@ -52,6 +52,12 @@ def release(key: str) -> None:
         lock.release()
 
 
+def is_locked(key: str) -> bool:
+    with _locks_guard:
+        lock = _locks.get(key)
+    return lock is not None and lock.locked()
+
+
 def any_locked() -> bool:
     """Có khoá nào (bất kỳ key nào) đang bị giữ hay không — dùng để chờ mọi
     thread nền THẬT SỰ đã xong việc, không chỉ đợi response HTTP trả về

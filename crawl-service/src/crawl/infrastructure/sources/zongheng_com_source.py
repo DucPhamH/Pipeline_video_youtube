@@ -38,7 +38,6 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef, NovelRef
 from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
-from crawl.infrastructure.sources.content_pipeline import check_fetched_html
 
 _BOOK_LIST_KEYS = (
     "lunBoList",

@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import threading
 import time
 
+import httpx
 from sqlalchemy.orm import Session
 
+from platform_.config import config
 from platform_.db import SessionLocal
 from platform_.settings_store import get_setting
 from translate.application.callback import notify_crawl
+from translate.application.error_codes import format_error
 from translate.application.estimate import (
     estimate_beats_pass_tokens,
     estimate_tokens,
@@ -20,7 +24,10 @@ from translate.application.fingerprint import cache_key as make_cache_key
 from translate.application.fingerprint import glossary_hash as make_glossary_hash
 from translate.application.key_rotator import KeyRotator, looks_rate_limited
 from translate.application.modes import build_glossary_extraction_prompt, build_glossary_seed_prompt
+from translate.application.modes import SKIN_MAP_PARAM
 from translate.application.modes import mode_params_hash as make_mode_params_hash
+from translate.application.segment_qa import QA_FLAGS, QualityRejected, blocking, check_output
+from translate.application.skin_map import effective_mode_params, generate_skin_map, skin_map_pairs
 from translate.domain.entities import (
     PROMPT_VERSION,
     ChapterSource,
@@ -34,8 +41,8 @@ from translate.domain.entities import (
     VariantStatus,
     Work,
 )
+from translate.infrastructure.ai_registry import key_slot_index, load_ai_provider
 from translate.infrastructure.persistence.repositories import (
-    AiProviderRepository,
     ChapterSourceRepository,
     GlossaryRepository,
     JobProviderSlotRepository,
@@ -48,13 +55,54 @@ from translate.infrastructure.persistence.repositories import (
 from translate.infrastructure.providers.openai_compat import (
     GlossaryPairs,
     OpenAICompatTranslator,
+    TranslationCancelled,
     build_translator,
+    polish_failed,
 )
+
+logger = logging.getLogger("translate.run_job")
+
+# "Thế hệ" chạy của từng job (in-process). Cancel → Resume sinh thread mới
+# trong khi thread cũ có thể vẫn kẹt trong 1 lệnh HTTP dài; status DB lúc đó đã
+# về QUEUED/RUNNING nên thread cũ không tự thấy mình bị dừng → 2 worker cùng
+# dịch 1 job. Mỗi lần start tăng generation; worker nào thấy generation của
+# mình không còn là mới nhất thì coi như bị cancel và thoát.
+_run_generation: dict[int, int] = {}
+_run_generation_guard = threading.Lock()
+
+
+def _next_generation(job_id: int) -> int:
+    with _run_generation_guard:
+        gen = _run_generation.get(job_id, 0) + 1
+        _run_generation[job_id] = gen
+        return gen
+
+
+def _is_stale_run(job_id: int, generation: int | None) -> bool:
+    if generation is None:
+        return False
+    with _run_generation_guard:
+        return _run_generation.get(job_id) != generation
 
 
 def start_job_thread(job_id: int) -> None:
     """Chạy run_job() nền — dùng ở router (start/resume) và auto-chain fork."""
-    threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
+    generation = _next_generation(job_id)
+    threading.Thread(
+        target=run_job, args=(job_id,), kwargs={"generation": generation}, daemon=True
+    ).start()
+
+
+def _job_stop_check(job_repo: "JobRepository", job_id: int, generation: int | None):
+    """Callback `is_cancelled` cho worker: đọc status tươi (không qua identity
+    map) + coi run cũ (generation lỗi thời) như bị cancel."""
+
+    def _is_cancelled() -> bool:
+        if _is_stale_run(job_id, generation):
+            return True
+        return job_repo.get_status(job_id) == JobStatus.CANCELLED
+
+    return _is_cancelled
 
 # Gợi ý model phổ biến — user vẫn gõ tự do.
 SUGGESTED_MODELS = [
@@ -83,6 +131,9 @@ def _api_key_hint(key: str) -> str:
     k = (key or "").strip()
     if not k:
         return ""
+    slot = key_slot_index(k)
+    if slot is not None:
+        return f"key {slot + 1}"
     if len(k) <= 4:
         return "****"
     return f"…{k[-4:]}"
@@ -112,7 +163,7 @@ def resolve_provider_config(
 
     Trả provider/model/base_url/api_key/requires_api_key đã resolve.
     """
-    saved = AiProviderRepository(db).get(ai_provider_id) if ai_provider_id is not None else None
+    saved = load_ai_provider(db, ai_provider_id)
     if ai_provider_id is not None and saved is None:
         raise ValueError(f"AI provider {ai_provider_id} không tồn tại")
 
@@ -159,8 +210,15 @@ def resolve_provider_config(
 
     if not chosen_model:
         chosen_model = "deepseek-chat"
+    using_gateway = (
+        bool((config.ai_api_base_url or "").strip())
+        and saved is not None
+        and (saved.provider or "") != "mock"
+    )
     if chosen_provider == "mock":
         effective = "mock"
+    elif using_gateway:
+        effective = "openai"
     elif not chosen_key and chosen_requires_key:
         if (provider or "").strip().lower() == "openai":
             raise ValueError("provider=openai cần api_key — điền key trên desk trước khi dịch")
@@ -174,6 +232,7 @@ def resolve_provider_config(
         "base_url": chosen_base,
         "api_key": chosen_key,
         "requires_api_key": chosen_requires_key,
+        "ai_provider_id": saved.id if saved is not None else None,
     }
 
 
@@ -203,7 +262,8 @@ def _prior_context_tail(seg_repo: SegmentRepository, *, job_id: int, chapter_ind
 
 
 def _load_glossary_pairs(db: Session, work_id: int) -> tuple[GlossaryPairs, str]:
-    terms = GlossaryRepository(db).list_by_work(work_id)
+    # Chỉ thuật ngữ đã duyệt vào prompt/hash — candidate (bảng duyệt tên) chờ user.
+    terms = [t for t in GlossaryRepository(db).list_by_work(work_id) if t.status == "approved"]
     pairs: GlossaryPairs = [
         (t.source_term, t.target_term, t.protected) for t in terms if t.source_term.strip()
     ]
@@ -252,15 +312,17 @@ def _segment_cache_key(
     )
 
 
-def _estimate_for_work(db: Session, *, work: Work, mode: str = "full") -> dict:
+def _estimate_for_work(db: Session, *, work: Work, mode: str = "full", polish: bool = False) -> dict:
     """Ước chi phí dịch dựa trên toàn bộ ChapterSource của Work. `mode` chỉ ảnh
     hưởng số pass LLM (audio_cut chạy thêm 1 pass must_keep_beats — spec 4.3),
     không đổi lượng văn bản nguồn."""
     chapters = ChapterSourceRepository(db).list_by_work(work.id)  # type: ignore[arg-type]
     blob = "\n".join(ch.text or "" for ch in chapters)
     tokens = estimate_tokens(blob, lang_src=work.lang_src)
-    if mode == "audio_cut":
+    if mode in ("audio_cut", "reskin"):
         tokens += estimate_beats_pass_tokens(blob, lang_src=work.lang_src)
+    if polish:
+        tokens += estimate_tokens(blob, lang_src=work.lang_src)
     usd_per_1k = float(get_setting(db, "translate.usd_per_1k_tokens") or 0.0)
     budget = float(get_setting(db, "translate.budget_usd_per_job") or 0.0)
     usd = estimate_usd(tokens, usd_per_1k=usd_per_1k)
@@ -282,14 +344,18 @@ def estimate_variant(db: Session, *, variant_id: int) -> dict:
     work = WorkRepository(db).get(variant.work_id)
     if work is None:
         raise LookupError(f"Work {variant.work_id} không tồn tại")
-    return {"variant_id": variant_id, **_estimate_for_work(db, work=work, mode=variant.mode)}
+    polish = bool((variant.mode_params or {}).get("polish"))
+    return {
+        "variant_id": variant_id,
+        **_estimate_for_work(db, work=work, mode=variant.mode, polish=polish),
+    }
 
 
-def estimate_work(db: Session, *, work_id: int, mode: str = "full") -> dict:
+def estimate_work(db: Session, *, work_id: int, mode: str = "full", polish: bool = False) -> dict:
     work = WorkRepository(db).get(work_id)
     if work is None:
         raise LookupError(f"Work {work_id} không tồn tại")
-    return {"work_id": work_id, **_estimate_for_work(db, work=work, mode=mode)}
+    return {"work_id": work_id, **_estimate_for_work(db, work=work, mode=mode, polish=polish)}
 
 
 def _prepare_segment_sources(
@@ -393,8 +459,76 @@ def _keys_from_ai_provider(p) -> list[str]:
     return _dedupe_keys(getattr(p, "api_keys", None), [getattr(p, "api_key", "") or ""])
 
 
+def _aux_chat(job: Job, *, system: str, user: str, is_cancelled=None) -> str:
+    """Lệnh gọi phụ (trích glossary) bằng credential của job — qua cùng cơ chế
+    giãn cách/semaphore với lượt dịch, và dừng được khi job bị Cancel."""
+    return aux_chat_config(
+        {
+            "base_url": job.base_url,
+            "api_key": job.api_key or "",
+            "model": _creds_from_job(job)[1],
+            "ai_provider_id": job.ai_provider_id,
+        },
+        system=system,
+        user=user,
+        is_cancelled=is_cancelled,
+    )
+
+
+def aux_chat_config(cfg: dict, *, system: str, user: str, is_cancelled=None) -> str:
+    """Lệnh gọi phụ ngoài job (bảng duyệt tên, bảng đổi vỏ) — cfg đã resolve
+    (base_url/api_key/model), cùng giãn cách/semaphore với lượt dịch."""
+    stop = is_cancelled or (lambda: False)
+    base_url = str(cfg.get("base_url") or "")
+    api_key = str(cfg.get("api_key") or "")
+    translator = OpenAICompatTranslator(
+        base_url=base_url, api_key=api_key, model=_effective_model(str(cfg.get("model") or "")), max_retries=2
+    )
+    raw_id = cfg.get("ai_provider_id")
+    translator.gateway_provider_id = _gateway_id(int(raw_id)) if raw_id else None
+    translator.should_stop = stop
+    cancelled, raw = _call_with_shared_pacing(
+        provider="openai",
+        base_url=base_url,
+        api_key=api_key,
+        is_cancelled=stop,
+        call=lambda: translator._chat(system=system, user=user),  # noqa: SLF001
+    )
+    if cancelled:
+        raise TranslationCancelled()
+    return raw
+
+
+def _auto_generate_skin_map(db: Session, *, variant: Variant, job: Job, is_cancelled=None) -> None:
+    """Job reskin bắt đầu mà bảng đổi vỏ còn rỗng → AI tự đề xuất trước khi
+    dịch chương nào. Best-effort: lỗi/cancel thì chạy tiếp với bảng rỗng."""
+    if variant.mode != "reskin" or variant.id is None:
+        return
+    if skin_map_pairs(db, variant.id):
+        return
+    if (job.provider or "").strip().lower() != "openai":
+        return
+    try:
+        generate_skin_map(
+            db,
+            variant=variant,
+            chat=lambda system, user: _aux_chat(job, system=system, user=user, is_cancelled=is_cancelled),
+        )
+    except TranslationCancelled:
+        db.rollback()
+    except Exception:  # noqa: BLE001 — không chặn job
+        db.rollback()
+        logger.warning("Tự tạo bảng đổi vỏ thất bại (variant #%s)", variant.id, exc_info=True)
+
+
 def _auto_seed_glossary_pre_translate(
-    db: Session, *, work: Work, variant: Variant, chapters: list[ChapterSource], job: Job
+    db: Session,
+    *,
+    work: Work,
+    variant: Variant,
+    chapters: list[ChapterSource],
+    job: Job,
+    is_cancelled=None,
 ) -> None:
     """Trích glossary TRƯỚC khi dịch chương nào — chạy 1 lần, ngay khi job full
     ĐẦU TIÊN của Work bắt đầu (trước khi spawn pool/fallback/single), nếu Work
@@ -421,17 +555,16 @@ def _auto_seed_glossary_pre_translate(
         return
 
     try:
-        translator = OpenAICompatTranslator(
-            base_url=job.base_url, api_key=job.api_key or "", model=job.model, max_retries=2
-        )
-        raw = translator._chat(  # noqa: SLF001 — dùng nội bộ cho 1 lệnh gọi phụ, không qua translate()
-            system=build_glossary_seed_prompt(variant.lang_tgt), user=sample
+        raw = _aux_chat(
+            job, system=build_glossary_seed_prompt(variant.lang_tgt), user=sample, is_cancelled=is_cancelled
         )
         text = raw.strip()
         if text.startswith("```"):
             text = text.strip("`")
             text = text.split("\n", 1)[1] if "\n" in text else text
         items = json.loads(text)
+    except TranslationCancelled:
+        return  # job vừa bị dừng — vòng dịch phía sau tự thấy cancel và thoát
     except Exception:  # noqa: BLE001 — best-effort, không chặn job dịch
         return
 
@@ -463,7 +596,9 @@ def _auto_seed_glossary_pre_translate(
         db.commit()
 
 
-def _auto_extract_glossary_if_empty(db: Session, *, work: Work, variant: Variant, job: Job) -> None:
+def _auto_extract_glossary_if_empty(
+    db: Session, *, work: Work, variant: Variant, job: Job, is_cancelled=None
+) -> None:
     """Tự trích glossary (tên nhân vật/địa danh) từ vài chương đầu bản Đầy đủ
     vừa dịch xong — user không phải tự gõ tay. Chỉ chạy khi Work CHƯA có glossary
     nào (không ghi đè lựa chọn tay của user) và job dùng AI thật (mock không
@@ -509,17 +644,19 @@ def _auto_extract_glossary_if_empty(db: Session, *, work: Work, variant: Variant
         return
 
     try:
-        translator = OpenAICompatTranslator(
-            base_url=job.base_url, api_key=job.api_key or "", model=job.model, max_retries=2
-        )
-        raw = translator._chat(  # noqa: SLF001 — dùng nội bộ cho 1 lệnh gọi phụ, không qua translate()
-            system=build_glossary_extraction_prompt(), user="\n\n---\n\n".join(blocks)
+        raw = _aux_chat(
+            job,
+            system=build_glossary_extraction_prompt(),
+            user="\n\n---\n\n".join(blocks),
+            is_cancelled=is_cancelled,
         )
         text = raw.strip()
         if text.startswith("```"):
             text = text.strip("`")
             text = text.split("\n", 1)[1] if "\n" in text else text
         items = json.loads(text)
+    except TranslationCancelled:
+        return
     except Exception:  # noqa: BLE001 — best-effort, không làm fail job
         return
 
@@ -563,12 +700,11 @@ def _resolve_slot_specs(
     - `ai_selections`: mỗi AI có thể override `model` cho job này + `use_all_keys`
       (nhiều key CÙNG model đó → nhiều slot, kiểu AiNiee/Glossarion).
     """
-    ai_repo = AiProviderRepository(db)
     specs: list[dict] = []
     if ai_selections:
         for sel in ai_selections:
             pid = sel.get("ai_provider_id")
-            p = ai_repo.get(pid)
+            p = load_ai_provider(db, pid)
             if p is None:
                 raise ValueError(f"AI provider {pid} không tồn tại")
             chosen_model = (str(sel.get("model") or "").strip() or p.model or "").strip()
@@ -600,7 +736,7 @@ def _resolve_slot_specs(
                 )
     else:
         for pid in ai_provider_ids or []:
-            p = ai_repo.get(pid)
+            p = load_ai_provider(db, pid)
             if p is None:
                 raise ValueError(f"AI provider {pid} không tồn tại")
             specs.append(
@@ -683,7 +819,7 @@ def _enqueue_multi_ai_job(
     )
 
     _, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-    mphash = make_mode_params_hash(variant.mode_params)
+    mphash = make_mode_params_hash(effective_mode_params(db, variant))
     n = len(slot_specs)
     segments = [
         Segment(
@@ -799,11 +935,11 @@ def enqueue_job(
     # cần tick use_all_keys (pool). use_all_keys vẫn tạo nhiều slot song song.
     snap_keys: list[str] = []
     if linked_ai_id is not None:
-        snap_keys = _keys_from_ai_provider(AiProviderRepository(db).get(linked_ai_id))
+        snap_keys = _keys_from_ai_provider(load_ai_provider(db, linked_ai_id))
     snap_keys = _dedupe_keys(snap_keys, [str(cfg.get("api_key") or "")])
 
     _, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-    mphash = make_mode_params_hash(variant.mode_params)
+    mphash = make_mode_params_hash(effective_mode_params(db, variant))
 
     job = job_repo.add(
         Job(
@@ -893,6 +1029,7 @@ def resume_job(
         for seg in retryable:
             seg.status = SegmentStatus.PENDING
             seg.error = None
+            seg.qa_flags = []
             seg_repo.update(seg)
     else:
         # Không truyền gì (resume trơn) nhưng job này vốn gắn với 1 AI đã lưu
@@ -933,15 +1070,16 @@ def resume_job(
             job.ai_provider_id = None  # override tay -> không còn tự refresh theo registry nữa
         # Làm mới danh sách key xoay vòng từ registry (nếu còn gắn).
         if job.ai_provider_id is not None:
-            fresh_keys = _keys_from_ai_provider(AiProviderRepository(db).get(job.ai_provider_id))
+            fresh_keys = _keys_from_ai_provider(load_ai_provider(db, job.ai_provider_id))
             if fresh_keys:
                 job.api_keys = fresh_keys
 
         _, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-        mphash = make_mode_params_hash(variant.mode_params)
+        mphash = make_mode_params_hash(effective_mode_params(db, variant))
         for seg in retryable:
             seg.status = SegmentStatus.PENDING
             seg.error = None
+            seg.qa_flags = []
             seg.cache_key = _segment_cache_key(
                 source_text=seg.source_text,
                 variant=variant,
@@ -958,6 +1096,42 @@ def resume_job(
     variant_repo.update_status(job.variant_id, VariantStatus.QUEUED)
     db.commit()
     return job
+
+
+def retranslate_flagged(db: Session, *, job_id: int, flag: str | None = None) -> Job:
+    """Đưa các segment bị QA gắn cờ (`flag`, hoặc mọi cờ nếu None) về PENDING
+    rồi resume. Xoá entry cache của bản bị gắn cờ — nếu không, run mới hit
+    cache và nhận lại y nguyên bản cũ."""
+    job_repo = JobRepository(db)
+    seg_repo = SegmentRepository(db)
+    cache_repo = TranslationCacheRepository(db)
+
+    job = job_repo.get(job_id)
+    if job is None:
+        raise LookupError(f"Job {job_id} không tồn tại")
+    if job.status in (JobStatus.QUEUED, JobStatus.RUNNING):
+        raise ValueError("Job đang chạy — dừng trước khi dịch lại segment bị gắn cờ")
+    if flag is not None and flag not in QA_FLAGS:
+        raise ValueError(f"flag không hợp lệ: {flag} ({'|'.join(QA_FLAGS)})")
+
+    targets = [
+        s
+        for s in seg_repo.list_by_job(job_id)
+        if s.qa_flags and (flag is None or flag in s.qa_flags)
+    ]
+    if not targets:
+        raise ValueError("Không có segment nào bị gắn cờ" + (f" '{flag}'" if flag else ""))
+    for seg in targets:
+        if seg.cache_key and seg.status in (SegmentStatus.DONE, SegmentStatus.SKIPPED_CACHE):
+            cache_repo.delete(seg.cache_key)
+        seg.status = SegmentStatus.PENDING
+        seg.output_text = None
+        seg.error = None
+        seg.qa_flags = []
+        seg.story_state = ""
+        seg_repo.update(seg)
+    db.commit()
+    return resume_job(db, job_id=job_id)
 
 
 def _stop_job(db: Session, *, job_id: int, reason: str) -> Job:
@@ -1091,7 +1265,7 @@ def set_job_provider(
         job.ai_provider_id = None
 
     _, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-    mphash = make_mode_params_hash(variant.mode_params)
+    mphash = make_mode_params_hash(effective_mode_params(db, variant))
 
     job.provider = cfg["provider"]
     job.model = cfg["model"]
@@ -1114,6 +1288,7 @@ def set_job_provider(
         if seg.status == SegmentStatus.FAILED:
             seg.status = SegmentStatus.PENDING
             seg.error = None
+            seg.qa_flags = []
         seg_repo.update(seg)
 
     db.commit()
@@ -1124,20 +1299,48 @@ def set_job_model(db: Session, *, job_id: int, model: str) -> Job:
     """Alias — chỉ đổi model."""
     return set_job_provider(db, job_id=job_id, model=model)
 
+_DEFAULT_MODEL = "deepseek-chat"
+
+
+def _effective_model(model: str | None) -> str:
+    """Model thật sẽ gửi đi — dùng chung cho cache_key và translator."""
+    return (model or "").strip() or _DEFAULT_MODEL
+
+
 def _creds_from_job(j: Job) -> tuple[str, str, str, str]:
     provider = (j.provider or "mock").strip().lower()
-    model = (j.model or "").strip() or "deepseek-chat"
+    model = _effective_model(j.model)
     base_url = (j.base_url or "").strip()
     api_key = (j.api_key or "").strip()
-    if provider != "mock" and not api_key and j.requires_api_key:
+    if provider != "mock" and not api_key and j.requires_api_key and not _gateway_id(j.ai_provider_id):
         provider = "mock"
     return provider, model, base_url, api_key
 
 
+def _gateway_id(provider_id: int | None) -> int | None:
+    if provider_id and (config.ai_api_base_url or "").strip():
+        return provider_id
+    return None
+
+
 def _build_job_translator(
-    prov: str, m: str, bu: str, key: str, requires_key: bool, *, max_retries: int | None = None
+    prov: str,
+    m: str,
+    bu: str,
+    key: str,
+    requires_key: bool,
+    *,
+    max_retries: int | None = None,
+    gateway_provider_id: int | None = None,
 ):
-    t = build_translator(provider=prov, base_url=bu, api_key=key, model=m, requires_api_key=requires_key)
+    t = build_translator(
+        provider=prov,
+        base_url=bu,
+        api_key=key,
+        model=m,
+        requires_api_key=requires_key,
+        gateway_provider_id=gateway_provider_id,
+    )
     if max_retries is not None and hasattr(t, "max_retries"):
         t.max_retries = max_retries
     return t
@@ -1147,14 +1350,13 @@ def _refresh_pool_slot_credentials(db: Session, *, job_id: int) -> None:
     """Resume job nhiều slot: refresh key/url từ registry theo ai_provider_id,
     GIỮ model đã snapshot trên từng slot (job-level override)."""
     slot_repo = JobProviderSlotRepository(db)
-    ai_repo = AiProviderRepository(db)
     slots = slot_repo.list_by_job(job_id)
     by_ai: dict[int, list[JobProviderSlot]] = {}
     for s in slots:
         if s.ai_provider_id is not None:
             by_ai.setdefault(s.ai_provider_id, []).append(s)
     for pid, group in by_ai.items():
-        p = ai_repo.get(pid)
+        p = load_ai_provider(db, pid)
         if p is None:
             continue
         fresh = _keys_from_ai_provider(p)
@@ -1206,25 +1408,36 @@ def _call_translate_rotating(
     rotator: KeyRotator,
     is_cancelled,
     translate_call,
+    gateway_provider_id: int | None = None,
 ):
     """Gọi translate với round-robin key; 429 → cooldown key đó, thử key khác
-    ngay (cùng model). Trả (cancelled, output)."""
+    ngay (cùng model). Nhiều key: 5xx/timeout → backoff rồi thử key kế (inner
+    retry chỉ 1 lần/key nên không tự backoff). Trả (cancelled, output)."""
     key_list = _dedupe_keys(keys) or [""]
-    last_exc: BaseException | None = None
     # Nhiều key: 1 lần thử/key rồi failover — tránh đốt phút backoff trên key chết.
     inner_retries = 1 if len(key_list) > 1 else None
-    for attempt in range(max(len(key_list), 1)):
+    transient_attempts = max(len(key_list), _MULTI_KEY_TRANSIENT_ATTEMPTS) if len(key_list) > 1 else 1
+    attempt = 0
+    while True:
         if is_cancelled():
             return True, None
         key = rotator.next_key()
         translator = _build_job_translator(
-            provider, model, base_url, key, requires_api_key, max_retries=inner_retries
+            provider,
+            model,
+            base_url,
+            key,
+            requires_api_key,
+            max_retries=inner_retries,
+            gateway_provider_id=gateway_provider_id,
         )
+        if hasattr(translator, "should_stop"):
+            translator.should_stop = is_cancelled
         try:
             cancelled, out = _call_with_shared_pacing(
                 provider=provider,
                 base_url=base_url,
-                api_key=key,
+                api_key=f"provider:{gateway_provider_id}{key}" if gateway_provider_id else key,
                 is_cancelled=is_cancelled,
                 call=lambda t=translator: translate_call(t),
             )
@@ -1232,13 +1445,37 @@ def _call_translate_rotating(
                 return True, None
             return False, out
         except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if looks_rate_limited(exc) and attempt + 1 < len(key_list):
+            attempt += 1
+            if looks_rate_limited(exc) and attempt < len(key_list):
                 rotator.cooldown(key, 45.0)
                 continue
+            if _looks_transient_server_error(exc) and attempt < transient_attempts:
+                if _wait_or_cancelled(min(2**attempt, 30), is_cancelled):
+                    return True, None
+                continue
             raise
-    assert last_exc is not None
-    raise last_exc
+
+
+_MULTI_KEY_TRANSIENT_ATTEMPTS = 4
+
+
+def _looks_transient_server_error(exc: BaseException) -> bool:
+    """5xx hoặc lỗi mạng (timeout, mất kết nối) — tự hết sau 1 lúc, khác
+    404/401 (chết hẳn) hay "request quá to" (phải chia nhỏ)."""
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response is not None and exc.response.status_code >= 500
+    return False
+
+
+def _wait_or_cancelled(seconds: float, is_cancelled) -> bool:
+    end = time.time() + seconds
+    while time.time() < end:
+        if is_cancelled():
+            return True
+        time.sleep(min(0.4, max(0.0, end - time.time())))
+    return False
 
 
 # --- Giãn cách dùng CHUNG theo (base_url, api_key) — nhiều job/thread trỏ tới
@@ -1298,7 +1535,10 @@ def _call_with_shared_pacing(
        của CẢ hệ thống, kể cả khác identity.
     Trả (cancelled, result); result=None nếu cancelled giữa lúc chờ."""
     if provider == "mock":
-        return False, call()
+        try:
+            return False, call()
+        except TranslationCancelled:
+            return True, None
 
     identity = _provider_identity(base_url, api_key)
     lock = _get_identity_lock(identity)
@@ -1329,6 +1569,8 @@ def _call_with_shared_pacing(
         return True, None
     try:
         return False, call()
+    except TranslationCancelled:
+        return True, None
     finally:
         _global_call_semaphore.release()
 
@@ -1344,6 +1586,7 @@ def _run_single_ai_segments(
     mphash: str,
     effective_lang_src: str,
     already_translated: bool,
+    generation: int | None = None,
 ) -> None:
     """1 AI cho cả job — tôn trọng job.model/provider, hot-swap giữa chừng nếu
     user PATCH provider trong lúc đang chạy. Nhiều key snapshot → round-robin
@@ -1358,18 +1601,18 @@ def _run_single_ai_segments(
     if model != job.model:
         job.model = model
         job_repo.update(job)
+        db.commit()
 
     key_pool = _dedupe_keys(job.api_keys, [api_key])
     rotator = KeyRotator(key_pool)
     requires_key = job.requires_api_key
     current_model = model
-    current_sig = (provider_setting, model, base_url, "|".join(key_pool))
+    current_sig = (provider_setting, model, base_url, "|".join(key_pool), job.ai_provider_id)
+    active_gateway = _gateway_id(job.ai_provider_id)
     track_story_state = bool((variant.mode_params or {}).get("track_story_state"))
     use_prior = variant.mode in _CONTEXT_CARRY_MODES or track_story_state
 
-    def _is_cancelled() -> bool:
-        j = job_repo.get(job_id)
-        return j is not None and j.status == JobStatus.CANCELLED
+    _is_cancelled = _job_stop_check(job_repo, job_id, generation)
 
     def _sleep_interruptible(seconds: float) -> bool:
         """True nếu bị cancel trong lúc chờ."""
@@ -1380,18 +1623,19 @@ def _run_single_ai_segments(
             time.sleep(min(0.4, max(0.0, end - time.time())))
         return False
 
-    def _fill_story_state_if_needed(seg: Segment, output: str, summarizer) -> None:
-        if not track_story_state:
-            return
-        if (seg.story_state or "").strip():
-            return
-        prev_state = _story_state_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
-        try:
-            seg.story_state = summarizer.summarize_state(
-                previous_state=prev_state, new_chapter_text=output
-            )
-        except Exception:  # noqa: BLE001
-            seg.story_state = prev_state
+    def _summarize(prev_state: str, text: str) -> str:
+        return _summarize_paced(
+            provider=provider_setting,
+            base_url=base_url,
+            model=current_model,
+            requires_api_key=requires_key,
+            keys=key_pool,
+            rotator=rotator,
+            is_cancelled=_is_cancelled,
+            previous_state=prev_state,
+            new_chapter_text=text,
+            gateway_provider_id=active_gateway,
+        )
 
     segments = seg_repo.list_by_job(job_id)
     for seg in segments:
@@ -1400,14 +1644,16 @@ def _run_single_ai_segments(
         if seg.status in (SegmentStatus.DONE, SegmentStatus.SKIPPED_CACHE):
             continue
 
-        # Hot-swap: đọc lại credential job mỗi segment
+        # Hot-swap: đọc lại credential job mỗi segment (expire để chắc chắn
+        # SELECT lại, không lấy bản cũ trong identity map).
+        db.expire_all()
         fresh = job_repo.get(job_id)
         if fresh is not None:
             if fresh.status == JobStatus.CANCELLED:
                 break
             prov, m, bu, key = _creds_from_job(fresh)
             fresh_keys = _dedupe_keys(fresh.api_keys, [key])
-            sig = (prov, m, bu, "|".join(fresh_keys))
+            sig = (prov, m, bu, "|".join(fresh_keys), fresh.ai_provider_id)
             if sig != current_sig:
                 current_sig = sig
                 provider_setting, model, base_url = prov, m, bu
@@ -1415,6 +1661,7 @@ def _run_single_ai_segments(
                 rotator = KeyRotator(key_pool)
                 requires_key = fresh.requires_api_key
                 current_model = m
+                active_gateway = _gateway_id(fresh.ai_provider_id)
                 seg.cache_key = _segment_cache_key(
                     source_text=seg.source_text,
                     variant=variant,
@@ -1425,16 +1672,13 @@ def _run_single_ai_segments(
                 )
 
         try:
-            cached = cache_repo.get(seg.cache_key) if seg.cache_key else None
-            if cached is not None:
-                seg.output_text = cached
-                seg.status = SegmentStatus.SKIPPED_CACHE
-                seg.error = None
+            if _apply_cache_hit(cache_repo, seg, variant=variant, lang_src=effective_lang_src):
                 # Cache hit trước đây bỏ qua story_state → đứt chuỗi trí nhớ.
-                stub = _build_job_translator(
-                    provider_setting, current_model, base_url, key_pool[0] if key_pool else "", requires_key
-                )
-                _fill_story_state_if_needed(seg, cached, stub)
+                if track_story_state and not (seg.story_state or "").strip():
+                    prev_state = _story_state_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
+                    seg.story_state = _story_state_or_previous(
+                        prev_state, lambda p=prev_state, t=seg.output_text or "": _summarize(p, t)
+                    )
                 seg_repo.update(seg)
                 db.commit()
                 continue
@@ -1475,34 +1719,39 @@ def _run_single_ai_segments(
                 rotator=rotator,
                 is_cancelled=_is_cancelled,
                 translate_call=_do_translate,
+                gateway_provider_id=active_gateway,
             )
             if cancelled:
                 break
-            seg.output_text = out
+            text, flags, cacheable = _accept_output(seg, out, variant=variant, lang_src=effective_lang_src)
+            if _is_stale_run(job_id, generation):
+                # Run mới đã tiếp quản job — chỉ giữ kết quả vào cache (run mới
+                # sẽ tự hit cache), không ghi đè segment nó đang xử lý.
+                if cacheable:
+                    _cache_put_quietly(db, cache_repo, seg.cache_key, text)
+                break
+            seg.output_text = text
             seg.status = SegmentStatus.DONE
             seg.error = None
+            seg.qa_flags = flags
             if track_story_state:
-                try:
-                    # Dùng translator với key hiện tại của rotator để summarize
-                    summ = _build_job_translator(
-                        provider_setting,
-                        current_model,
-                        base_url,
-                        rotator.keys[0] if rotator.keys else "",
-                        requires_key,
-                    )
-                    seg.story_state = summ.summarize_state(
-                        previous_state=prev_state, new_chapter_text=out
-                    )
-                except Exception:  # noqa: BLE001 — best-effort, giữ nguyên state cũ
-                    seg.story_state = prev_state
+                seg.story_state = _story_state_or_previous(
+                    prev_state, lambda p=prev_state, t=text: _summarize(p, t)
+                )
             seg_repo.update(seg)
-            if seg.cache_key:
-                cache_repo.put(seg.cache_key, out)
+            if seg.cache_key and cacheable:
+                cache_repo.put(seg.cache_key, text)
             db.commit()
+        except TranslationCancelled:
+            db.rollback()
+            break
         except Exception as exc:  # noqa: BLE001 — ghi lỗi segment, tiếp tục
-            seg.status = SegmentStatus.FAILED
-            seg.error = str(exc)
+            # Session có thể đang hỏng (vd lỗi lúc flush/commit) — rollback
+            # trước, nếu không mọi lệnh ghi sau đều PendingRollbackError.
+            db.rollback()
+            if _is_stale_run(job_id, generation):
+                break
+            _mark_segment_failed(seg, exc)
             seg_repo.update(seg)
             db.commit()
             if looks_rate_limited(exc) or "429" in str(exc) or "Rate limit" in str(exc):
@@ -1510,170 +1759,421 @@ def _run_single_ai_segments(
                     break
 
 
-def _run_pool_worker(job_id: int, slot: JobProviderSlot) -> None:
-    """1 AI trong pool nhiều-AI-chia-nhau-dịch — session riêng (SQLAlchemy session
-    không thread-safe), chỉ xử lý segment đúng slot_index của mình, không hot-swap
-    (đổi AI giữa chừng cho pool job không hỗ trợ — xóa job và tạo lại nếu cần).
-    429 trên key của slot → thử sibling key cùng AI/model (failover trong chương)."""
+def _cache_put_quietly(db: Session, cache_repo: TranslationCacheRepository, key: str, out) -> None:
+    if not key or not out:
+        return
+    try:
+        cache_repo.put(key, out)
+        db.commit()
+    except Exception:  # noqa: BLE001 — best-effort
+        db.rollback()
+
+
+# --- Kết quả 1 segment: QA, cache, story_state — dùng chung cho single/pool/fallback.
+
+
+def _qa_flags_for(seg: Segment, text: str, *, variant: Variant, lang_src: str) -> list[str]:
+    return check_output(
+        source=seg.source_text,
+        output=text,
+        lang_src=lang_src,
+        lang_tgt=variant.lang_tgt,
+        mode=variant.mode,
+        skin_map=(variant.mode_params or {}).get(SKIN_MAP_PARAM),
+    )
+
+
+def _accept_output(seg: Segment, out, *, variant: Variant, lang_src: str) -> tuple[str, list[str], bool]:
+    """QA output vừa dịch. Trả (text, flags, cacheable). Flag chặn (refusal)
+    → raise QualityRejected để tầng gọi xử lý như 1 lỗi segment (không cache).
+    Polish lỗi → giữ bản chưa polish nhưng KHÔNG cache dưới key có polish."""
+    unpolished = polish_failed(out)
+    text = str(out)
+    flags = _qa_flags_for(seg, text, variant=variant, lang_src=lang_src)
+    hard = blocking(flags)
+    if hard:
+        raise QualityRejected(hard, text)
+    if unpolished:
+        flags.append("polish_failed")
+    return text, flags, not unpolished
+
+
+def _apply_cache_hit(
+    cache_repo: TranslationCacheRepository, seg: Segment, *, variant: Variant, lang_src: str
+) -> bool:
+    """Cache hit → điền segment SKIPPED_CACHE. Entry cache bị QA chặn (vd lời
+    từ chối lưu từ trước khi có QA) coi như miss để dịch lại."""
+    cached = cache_repo.get(seg.cache_key) if seg.cache_key else None
+    if cached is None:
+        return False
+    flags = _qa_flags_for(seg, cached, variant=variant, lang_src=lang_src)
+    if blocking(flags):
+        return False
+    seg.output_text = cached
+    seg.status = SegmentStatus.SKIPPED_CACHE
+    seg.error = None
+    seg.qa_flags = flags
+    return True
+
+
+def _mark_segment_failed(seg: Segment, exc: BaseException | str, *, prefix: str = "") -> None:
+    seg.status = SegmentStatus.FAILED
+    seg.error = format_error(exc, prefix=prefix)
+    seg.qa_flags = list(getattr(exc, "flags", None) or [])
+
+
+def _summarize_paced(
+    *,
+    provider: str,
+    base_url: str,
+    model: str,
+    requires_api_key: bool,
+    keys: list[str],
+    rotator: KeyRotator,
+    is_cancelled,
+    previous_state: str,
+    new_chapter_text: str,
+    gateway_provider_id: int | None = None,
+) -> str:
+    """Cập nhật story_state qua CÙNG đường gọi với lượt dịch (xoay key, giãn
+    cách, semaphore, cancel). Cancel → TranslationCancelled."""
+    cancelled, out = _call_translate_rotating(
+        provider=provider,
+        base_url=base_url,
+        model=model,
+        requires_api_key=requires_api_key,
+        keys=keys,
+        rotator=rotator,
+        is_cancelled=is_cancelled,
+        translate_call=lambda t: t.summarize_state(
+            previous_state=previous_state, new_chapter_text=new_chapter_text
+        ),
+        gateway_provider_id=gateway_provider_id,
+    )
+    if cancelled:
+        raise TranslationCancelled()
+    return out
+
+
+def _story_state_or_previous(prev_state: str, summarize) -> str:
+    """Best-effort: lỗi summarize giữ state cũ — nhưng Cancel phải lan ra ngoài."""
+    try:
+        return summarize()
+    except TranslationCancelled:
+        raise
+    except Exception:  # noqa: BLE001
+        return prev_state
+
+
+def _permanent_slot_failure(exc: BaseException) -> bool:
+    """Model hoặc key chết hẳn (404, sai key). 429 và 5xx tạm thời không tính."""
+    if looks_rate_limited(exc):
+        return False
+    msg = str(exc).lower()
+    if msg.startswith(("500 ", "502 ", "503 ", "504 ")) or any(
+        token in msg for token in (" 500 ", " 502 ", " 503 ", " 504 ")
+    ):
+        return False
+    if msg.startswith(("401 ", "403 ", "404 ")) or any(
+        token in msg for token in (" 401 ", " 403 ", " 404 ")
+    ):
+        return True
+    return any(
+        needle in msg
+        for needle in (
+            "model_not_found",
+            "model not found",
+            "decommissioned",
+            "invalid_api_key",
+            "invalid api key",
+            "incorrect api key",
+        )
+    )
+
+
+def _run_pool_worker(job_id: int, slot: JobProviderSlot, generation: int | None = None) -> None:
+    """1 AI trong pool — session riêng. Lỗi bất ngờ (setup, commit hỏng…) không
+    được làm thread chết im lặng để lại segment PENDING: các segment còn lại
+    của slot bị đánh FAILED để tổng kết job không báo COMPLETED nhầm."""
     db = SessionLocal()
     try:
-        job_repo = JobRepository(db)
-        variant_repo = VariantRepository(db)
-        work_repo = WorkRepository(db)
-        chapter_repo = ChapterSourceRepository(db)
-        seg_repo = SegmentRepository(db)
-        cache_repo = TranslationCacheRepository(db)
-        slot_repo = JobProviderSlotRepository(db)
-
-        job = job_repo.get(job_id)
-        if job is None:
-            return
-        variant = variant_repo.get(job.variant_id)
-        if variant is None:
-            return
-        work = work_repo.get(variant.work_id)
-        if work is None:
-            return
-
-        chapters_by_index = {
-            ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
-        }
-        glossary, _ = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-        effective_lang_src = _effective_lang_src(variant, work)
-        already_translated = variant.source_variant_id is not None
-        track_story_state = bool((variant.mode_params or {}).get("track_story_state"))
-        use_prior = variant.mode in _CONTEXT_CARRY_MODES or track_story_state
-
-        all_slots = slot_repo.list_by_job(job_id)
-        # Refresh slot entity from list (may have been updated on resume)
-        slot = next((s for s in all_slots if s.slot_index == slot.slot_index), slot)
-        key_pool = _sibling_keys_for_slot(all_slots, slot)
-        rotator = KeyRotator(key_pool)
-
-        prov = (slot.provider or "mock").strip().lower()
-        model = (slot.model or "").strip() or "deepseek-chat"
-        if prov != "mock" and not key_pool and slot.requires_api_key:
-            prov = "mock"
-
-        def _is_cancelled() -> bool:
-            j = job_repo.get(job_id)
-            return j is not None and j.status == JobStatus.CANCELLED
-
-        def _sleep_interruptible(seconds: float) -> bool:
-            end = time.time() + seconds
-            while time.time() < end:
-                if _is_cancelled():
-                    return True
-                time.sleep(min(0.4, max(0.0, end - time.time())))
-            return False
-
-        segments = seg_repo.list_by_job_and_slot(job_id, slot.slot_index)
-        for seg in segments:
-            if _is_cancelled():
-                break
-            if seg.status in (SegmentStatus.DONE, SegmentStatus.SKIPPED_CACHE):
-                continue
-            try:
-                cached = cache_repo.get(seg.cache_key) if seg.cache_key else None
-                if cached is not None:
-                    seg.output_text = cached
-                    seg.status = SegmentStatus.SKIPPED_CACHE
-                    seg.error = None
-                    if track_story_state and not (seg.story_state or "").strip():
-                        prev_state = _story_state_tail(
-                            seg_repo, job_id=job_id, chapter_index=seg.chapter_index
-                        )
-                        stub = _build_job_translator(
-                            prov, model, slot.base_url, key_pool[0] if key_pool else "", slot.requires_api_key
-                        )
-                        try:
-                            seg.story_state = stub.summarize_state(
-                                previous_state=prev_state, new_chapter_text=cached
-                            )
-                        except Exception:  # noqa: BLE001
-                            seg.story_state = prev_state
-                    seg_repo.update(seg)
-                    db.commit()
-                    continue
-
-                ch = chapters_by_index.get(seg.chapter_index)
-                title = ch.title if ch else ""
-                prior_context = (
-                    _prior_context_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
-                    if use_prior
-                    else ""
-                )
-                prev_state = (
-                    _story_state_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
-                    if track_story_state
-                    else ""
-                )
-
-                def _do_translate(translator, *, _title=title, _prior=prior_context, _prev=prev_state):
-                    return translator.translate(
-                        text=seg.source_text,
-                        lang_src=effective_lang_src,
-                        lang_tgt=variant.lang_tgt,
-                        title=_title,
-                        glossary=glossary,
-                        mode=variant.mode,
-                        mode_params=variant.mode_params,
-                        already_translated=already_translated,
-                        prior_context=_prior,
-                        story_state=_prev,
-                    )
-
-                cancelled, out = _call_translate_rotating(
-                    provider=prov,
-                    base_url=slot.base_url,
-                    model=model,
-                    requires_api_key=slot.requires_api_key,
-                    keys=key_pool,
-                    rotator=rotator,
-                    is_cancelled=_is_cancelled,
-                    translate_call=_do_translate,
-                )
-                if cancelled:
-                    break
-                seg.output_text = out
-                seg.status = SegmentStatus.DONE
-                seg.error = None
-                if track_story_state:
-                    try:
-                        summ = _build_job_translator(
-                            prov, model, slot.base_url, key_pool[0] if key_pool else "", slot.requires_api_key
-                        )
-                        seg.story_state = summ.summarize_state(
-                            previous_state=prev_state, new_chapter_text=out
-                        )
-                    except Exception:  # noqa: BLE001 — best-effort, giữ nguyên state cũ
-                        seg.story_state = prev_state
-                seg_repo.update(seg)
-                if seg.cache_key:
-                    cache_repo.put(seg.cache_key, out)
-                db.commit()
-            except Exception as exc:  # noqa: BLE001 — ghi lỗi segment, tiếp tục
-                seg.status = SegmentStatus.FAILED
-                seg.error = str(exc)
-                seg_repo.update(seg)
-                db.commit()
-                if looks_rate_limited(exc) or "429" in str(exc) or "Rate limit" in str(exc):
-                    if _sleep_interruptible(15):
-                        break
+        _run_pool_worker_body(db, job_id, slot, generation)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("pool worker job=%s slot=%s crashed", job_id, slot.slot_index)
+        try:
+            db.rollback()
+            _fail_unfinished_slot_segments(
+                db, job_id=job_id, slot_index=slot.slot_index, generation=generation, exc=exc
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("pool worker job=%s: không ghi được segment FAILED", job_id)
     finally:
         db.close()
 
 
-def _slot_translator(slot: JobProviderSlot):
+def _fail_unfinished_slot_segments(
+    db: Session, *, job_id: int, slot_index: int, generation: int | None, exc: BaseException
+) -> None:
+    from translate.infrastructure.persistence.models import SegmentModel
+
+    if _is_stale_run(job_id, generation):
+        return  # run mới đã tiếp quản
+    if JobRepository(db).get_status(job_id) == JobStatus.CANCELLED:
+        return  # dừng tay — giữ PENDING để Resume chạy tiếp
+    db.query(SegmentModel).filter(
+        SegmentModel.job_id == job_id,
+        SegmentModel.slot_index == slot_index,
+        SegmentModel.status == SegmentStatus.PENDING.value,
+    ).update(
+        {
+            SegmentModel.status: SegmentStatus.FAILED.value,
+            SegmentModel.error: format_error(exc, code="worker_crashed", prefix="Worker AI dừng bất ngờ: "),
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+
+
+def _run_pool_worker_body(
+    db: Session, job_id: int, slot: JobProviderSlot, generation: int | None = None
+) -> None:
+    """Segment đúng slot_index của mình. 429 thì thử key khác cùng model. 404 /
+    key sai thì chuyển các chương còn lại của slot này sang một slot khác còn sống."""
+    job_repo = JobRepository(db)
+    variant_repo = VariantRepository(db)
+    work_repo = WorkRepository(db)
+    chapter_repo = ChapterSourceRepository(db)
+    seg_repo = SegmentRepository(db)
+    cache_repo = TranslationCacheRepository(db)
+    slot_repo = JobProviderSlotRepository(db)
+
+    job = job_repo.get(job_id)
+    if job is None:
+        return
+    variant = variant_repo.get(job.variant_id)
+    if variant is None:
+        return
+    work = work_repo.get(variant.work_id)
+    if work is None:
+        return
+    variant.mode_params = effective_mode_params(db, variant)
+
+    chapters_by_index = {
+        ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
+    }
+    glossary, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
+    mphash = make_mode_params_hash(effective_mode_params(db, variant))
+    effective_lang_src = _effective_lang_src(variant, work)
+    already_translated = variant.source_variant_id is not None
+    track_story_state = bool((variant.mode_params or {}).get("track_story_state"))
+    use_prior = variant.mode in _CONTEXT_CARRY_MODES or track_story_state
+
+    all_slots = slot_repo.list_by_job(job_id)
+    # Refresh slot entity from list (may have been updated on resume)
+    slot = next((s for s in all_slots if s.slot_index == slot.slot_index), slot)
+    dead_slots: set[int] = set()
+
+    def _bind(s: JobProviderSlot):
+        bound_prov = (s.provider or "mock").strip().lower()
+        bound_model = _effective_model(s.model)
+        keys = _sibling_keys_for_slot(all_slots, s)
+        if bound_prov != "mock" and not keys and s.requires_api_key and not _gateway_id(s.ai_provider_id):
+            bound_prov = "mock"
+        return bound_prov, bound_model, keys, KeyRotator(keys)
+
+    active = slot
+    prov, model, key_pool, rotator = _bind(active)
+
+    _is_cancelled = _job_stop_check(job_repo, job_id, generation)
+
+    def _sleep_interruptible(seconds: float) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            if _is_cancelled():
+                return True
+            time.sleep(min(0.4, max(0.0, end - time.time())))
+        return False
+
+    def _summarize(prev_state: str, text: str) -> str:
+        return _summarize_paced(
+            provider=prov,
+            base_url=active.base_url,
+            model=model,
+            requires_api_key=active.requires_api_key,
+            keys=key_pool,
+            rotator=rotator,
+            is_cancelled=_is_cancelled,
+            previous_state=prev_state,
+            new_chapter_text=text,
+            gateway_provider_id=_gateway_id(active.ai_provider_id),
+        )
+
+    segments = seg_repo.list_by_job_and_slot(job_id, slot.slot_index)
+    for seg in segments:
+        if _is_cancelled():
+            break
+        if seg.status in (SegmentStatus.DONE, SegmentStatus.SKIPPED_CACHE):
+            continue
+        if active.slot_index != slot.slot_index:
+            seg.slot_index = active.slot_index
+            seg.cache_key = _segment_cache_key(
+                source_text=seg.source_text,
+                variant=variant,
+                lang_src=effective_lang_src,
+                model=model,
+                ghash=ghash,
+                mphash=mphash,
+            )
+        try:
+            if _apply_cache_hit(cache_repo, seg, variant=variant, lang_src=effective_lang_src):
+                if track_story_state and not (seg.story_state or "").strip():
+                    prev_state = _story_state_tail(
+                        seg_repo, job_id=job_id, chapter_index=seg.chapter_index
+                    )
+                    seg.story_state = _story_state_or_previous(
+                        prev_state, lambda p=prev_state, t=seg.output_text or "": _summarize(p, t)
+                    )
+                seg_repo.update(seg)
+                db.commit()
+                continue
+
+            ch = chapters_by_index.get(seg.chapter_index)
+            title = ch.title if ch else ""
+            prior_context = (
+                _prior_context_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
+                if use_prior
+                else ""
+            )
+            prev_state = (
+                _story_state_tail(seg_repo, job_id=job_id, chapter_index=seg.chapter_index)
+                if track_story_state
+                else ""
+            )
+
+            def _do_translate(translator, *, _title=title, _prior=prior_context, _prev=prev_state):
+                return translator.translate(
+                    text=seg.source_text,
+                    lang_src=effective_lang_src,
+                    lang_tgt=variant.lang_tgt,
+                    title=_title,
+                    glossary=glossary,
+                    mode=variant.mode,
+                    mode_params=variant.mode_params,
+                    already_translated=already_translated,
+                    prior_context=_prior,
+                    story_state=_prev,
+                )
+
+            try:
+                if active.slot_index in dead_slots:
+                    raise RuntimeError("404 slot already dead")
+                cancelled, out = _call_translate_rotating(
+                    provider=prov,
+                    base_url=active.base_url,
+                    model=model,
+                    requires_api_key=active.requires_api_key,
+                    keys=key_pool,
+                    rotator=rotator,
+                    is_cancelled=_is_cancelled,
+                    translate_call=_do_translate,
+                    gateway_provider_id=_gateway_id(active.ai_provider_id),
+                )
+            except Exception as exc:
+                if not _permanent_slot_failure(exc):
+                    raise
+                dead_slots.add(active.slot_index)
+                cancelled = False
+                switched = False
+                for other in all_slots:
+                    if other.slot_index in dead_slots:
+                        continue
+                    op, om, okeys, orot = _bind(other)
+                    try:
+                        cancelled, out = _call_translate_rotating(
+                            provider=op,
+                            base_url=other.base_url,
+                            model=om,
+                            requires_api_key=other.requires_api_key,
+                            keys=okeys,
+                            rotator=orot,
+                            is_cancelled=_is_cancelled,
+                            translate_call=_do_translate,
+                            gateway_provider_id=_gateway_id(other.ai_provider_id),
+                        )
+                    except Exception as other_exc:  # noqa: BLE001
+                        if _permanent_slot_failure(other_exc):
+                            dead_slots.add(other.slot_index)
+                        continue
+                    active = other
+                    prov, model, key_pool, rotator = op, om, okeys, orot
+                    seg.slot_index = other.slot_index
+                    seg.cache_key = _segment_cache_key(
+                        source_text=seg.source_text,
+                        variant=variant,
+                        lang_src=effective_lang_src,
+                        model=om,
+                        ghash=ghash,
+                        mphash=mphash,
+                    )
+                    switched = True
+                    break
+                if not switched:
+                    raise
+            if cancelled:
+                break
+            text, flags, cacheable = _accept_output(seg, out, variant=variant, lang_src=effective_lang_src)
+            if _is_stale_run(job_id, generation):
+                if cacheable:
+                    _cache_put_quietly(db, cache_repo, seg.cache_key, text)
+                break
+            seg.output_text = text
+            seg.status = SegmentStatus.DONE
+            seg.error = None
+            seg.qa_flags = flags
+            seg.slot_index = active.slot_index
+            if track_story_state:
+                seg.story_state = _story_state_or_previous(
+                    prev_state, lambda p=prev_state, t=text: _summarize(p, t)
+                )
+            seg_repo.update(seg)
+            if seg.cache_key and cacheable:
+                cache_repo.put(seg.cache_key, text)
+            db.commit()
+        except TranslationCancelled:
+            db.rollback()
+            break
+        except Exception as exc:  # noqa: BLE001 — ghi lỗi segment, tiếp tục
+            db.rollback()
+            if _is_stale_run(job_id, generation):
+                break
+            _mark_segment_failed(seg, exc)
+            seg_repo.update(seg)
+            db.commit()
+            if looks_rate_limited(exc) or "429" in str(exc) or "Rate limit" in str(exc):
+                if _sleep_interruptible(15):
+                    break
+
+
+def _slot_provider(slot: JobProviderSlot) -> str:
     prov = (slot.provider or "mock").strip().lower()
-    if prov != "mock" and not (slot.api_key or "").strip() and slot.requires_api_key:
+    if (
+        prov != "mock"
+        and not (slot.api_key or "").strip()
+        and slot.requires_api_key
+        and not _gateway_id(slot.ai_provider_id)
+    ):
         prov = "mock"
+    return prov
+
+
+def _slot_translator(slot: JobProviderSlot):
     return build_translator(
-        provider=prov,
+        provider=_slot_provider(slot),
         base_url=slot.base_url,
         api_key=slot.api_key,
-        model=(slot.model or "").strip() or "deepseek-chat",
+        model=_effective_model(slot.model),
         requires_api_key=slot.requires_api_key,
+        gateway_provider_id=_gateway_id(slot.ai_provider_id),
     )
 
 
@@ -1689,6 +2189,7 @@ def _run_fallback_chain_segments(
     effective_lang_src: str,
     already_translated: bool,
     slots: list[JobProviderSlot],
+    generation: int | None = None,
 ) -> None:
     """>=2 AI theo THỨ TỰ ưu tiên, chạy tuần tự (không song song như pool).
     Dùng slot 0 cho tới khi nó lỗi liên tục trên 1 segment — thử hết cả dãy
@@ -1700,12 +2201,16 @@ def _run_fallback_chain_segments(
     track_story_state = bool((variant.mode_params or {}).get("track_story_state"))
     use_prior = variant.mode in _CONTEXT_CARRY_MODES or track_story_state
 
-    current_idx = 0
-    translator = _slot_translator(slots[current_idx])
+    _is_cancelled = _job_stop_check(job_repo, job_id, generation)
 
-    def _is_cancelled() -> bool:
-        j = job_repo.get(job_id)
-        return j is not None and j.status == JobStatus.CANCELLED
+    def _translator_for(idx: int):
+        t = _slot_translator(slots[idx])
+        if hasattr(t, "should_stop"):
+            t.should_stop = _is_cancelled
+        return t
+
+    current_idx = 0
+    translator = _translator_for(current_idx)
 
     def _sleep_interruptible(seconds: float) -> bool:
         end = time.time() + seconds
@@ -1714,6 +2219,21 @@ def _run_fallback_chain_segments(
                 return True
             time.sleep(min(0.4, max(0.0, end - time.time())))
         return False
+
+    def _summarize(slot: JobProviderSlot, prev_state: str, text: str) -> str:
+        keys = _dedupe_keys([slot.api_key or ""])
+        return _summarize_paced(
+            provider=_slot_provider(slot),
+            base_url=slot.base_url,
+            model=_effective_model(slot.model),
+            requires_api_key=slot.requires_api_key,
+            keys=keys,
+            rotator=KeyRotator(keys),
+            is_cancelled=_is_cancelled,
+            previous_state=prev_state,
+            new_chapter_text=text,
+            gateway_provider_id=_gateway_id(slot.ai_provider_id),
+        )
 
     segments = seg_repo.list_by_job(job_id)
     for seg in segments:
@@ -1726,23 +2246,28 @@ def _run_fallback_chain_segments(
             if _is_cancelled():
                 return
             slot = slots[current_idx]
+            # cache_key theo ĐÚNG model của slot sắp dùng — lúc enqueue mọi
+            # segment tính theo slot 0, nhưng sau khi "định cư" ở slot khác thì
+            # tra/ghi cache phải theo model thật đã dịch.
+            seg.cache_key = _segment_cache_key(
+                source_text=seg.source_text,
+                variant=variant,
+                lang_src=effective_lang_src,
+                model=_effective_model(slot.model),
+                ghash=ghash,
+                mphash=mphash,
+            )
             try:
-                cached = cache_repo.get(seg.cache_key) if seg.cache_key else None
-                if cached is not None:
-                    seg.output_text = cached
-                    seg.status = SegmentStatus.SKIPPED_CACHE
-                    seg.error = None
+                if _apply_cache_hit(cache_repo, seg, variant=variant, lang_src=effective_lang_src):
                     seg.slot_index = current_idx
                     if track_story_state and not (seg.story_state or "").strip():
                         prev_state = _story_state_tail(
                             seg_repo, job_id=job_id, chapter_index=seg.chapter_index
                         )
-                        try:
-                            seg.story_state = translator.summarize_state(
-                                previous_state=prev_state, new_chapter_text=cached
-                            )
-                        except Exception:  # noqa: BLE001
-                            seg.story_state = prev_state
+                        seg.story_state = _story_state_or_previous(
+                            prev_state,
+                            lambda sl=slot, p=prev_state, t=seg.output_text or "": _summarize(sl, p, t),
+                        )
                     seg_repo.update(seg)
                     db.commit()
                     break
@@ -1779,42 +2304,45 @@ def _run_fallback_chain_segments(
                 )
                 if cancelled:
                     return
-                seg.output_text = out
+                text, flags, cacheable = _accept_output(
+                    seg, out, variant=variant, lang_src=effective_lang_src
+                )
+                if _is_stale_run(job_id, generation):
+                    if cacheable:
+                        _cache_put_quietly(db, cache_repo, seg.cache_key, text)
+                    return
+                seg.output_text = text
                 seg.status = SegmentStatus.DONE
                 seg.error = None
+                seg.qa_flags = flags
                 seg.slot_index = current_idx
                 if track_story_state:
-                    try:
-                        seg.story_state = translator.summarize_state(
-                            previous_state=prev_state, new_chapter_text=out
-                        )
-                    except Exception:  # noqa: BLE001 — best-effort, giữ nguyên state cũ
-                        seg.story_state = prev_state
+                    seg.story_state = _story_state_or_previous(
+                        prev_state, lambda sl=slot, p=prev_state, t=text: _summarize(sl, p, t)
+                    )
                 seg_repo.update(seg)
-                if seg.cache_key:
-                    cache_repo.put(seg.cache_key, out)
+                if seg.cache_key and cacheable:
+                    cache_repo.put(seg.cache_key, text)
                 db.commit()
                 break
+            except TranslationCancelled:
+                db.rollback()
+                return
             except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                if _is_stale_run(job_id, generation):
+                    return
                 next_idx = current_idx + 1
                 if next_idx < len(slots):
                     # AI hiện tại vừa "tạch" — chuyển AI kế, thử lại NGAY đúng
                     # segment này (không đợi/backoff — AI khác, rate-limit khác).
+                    # cache_key tính lại ở đầu vòng lặp theo slot mới.
                     current_idx = next_idx
-                    translator = _slot_translator(slots[current_idx])
-                    seg.cache_key = _segment_cache_key(
-                        source_text=seg.source_text,
-                        variant=variant,
-                        lang_src=effective_lang_src,
-                        model=slots[current_idx].model,
-                        ghash=ghash,
-                        mphash=mphash,
-                    )
-                    seg.error = f"[{slot.label or slot.model}] {exc} — đã tự chuyển sang AI kế"
+                    translator = _translator_for(current_idx)
+                    seg.error = format_error(exc, prefix=f"{slot.label or slot.model}: ") + " — đã tự chuyển sang AI kế"
                     continue
                 # Đã thử hết mọi AI trong danh sách cho segment này — chịu thật.
-                seg.status = SegmentStatus.FAILED
-                seg.error = str(exc)
+                _mark_segment_failed(seg, exc)
                 seg.slot_index = current_idx
                 seg_repo.update(seg)
                 db.commit()
@@ -1827,190 +2355,330 @@ def _run_fallback_chain_segments(
                 # thành công — thất bại toàn bộ thì không biết slot nào đáng
                 # tin, nên cho cả dãy 1 cơ hội công bằng lại từ đầu.
                 current_idx = 0
-                translator = _slot_translator(slots[current_idx])
+                translator = _translator_for(current_idx)
                 if "429" in str(exc) or "Rate limit" in str(exc):
                     if _sleep_interruptible(15):
                         return
                 break
 
 
-def run_job(job_id: int) -> None:
+def run_job(job_id: int, generation: int | None = None) -> None:
     """Chạy trong thread nền — mở Session riêng.
 
     1 AI: tôn trọng job.model/provider (đổi mid-run qua PATCH được).
     Pool (>=2 job_provider_slots — nhiều AI chia nhau dịch): spawn 1 thread/AI,
     mỗi thread chỉ xử lý segment slot của mình (round-robin theo chương lúc
     enqueue), join xong mới sang bước tổng kết chung.
-    """
-    from translate.infrastructure.persistence.models import JobModel
 
+    Lỗi bất ngờ ngoài vòng segment (DB, bug...) → job FAILED kèm lỗi, không
+    kẹt RUNNING mãi (Resume bị chặn khi RUNNING).
+    """
     db = SessionLocal()
     try:
-        job_repo = JobRepository(db)
-        seg_repo = SegmentRepository(db)
-        variant_repo = VariantRepository(db)
-        work_repo = WorkRepository(db)
-        chapter_repo = ChapterSourceRepository(db)
+        _run_job_inner(db, job_id=job_id, generation=generation)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("run_job %s crashed", job_id)
+        try:
+            db.rollback()
+            _mark_job_crashed(db, job_id=job_id, generation=generation, exc=exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("run_job %s: không ghi được trạng thái FAILED", job_id)
+    finally:
+        db.close()
 
-        job = job_repo.get(job_id)
-        if job is None:
-            return
-        if job.status == JobStatus.CANCELLED:
-            return
 
-        variant = variant_repo.get(job.variant_id)
-        if variant is None:
-            job.status = JobStatus.FAILED
-            job.error = "Variant missing"
-            job_repo.update(job)
-            db.commit()
-            return
+def _mark_job_crashed(db: Session, *, job_id: int, generation: int | None, exc: BaseException) -> None:
+    from translate.infrastructure.persistence.models import JobModel
 
-        work = work_repo.get(variant.work_id)
-        if work is None:
-            job.status = JobStatus.FAILED
-            job.error = "Work missing"
-            job_repo.update(job)
-            db.commit()
-            return
-
-        slots = JobProviderSlotRepository(db).list_by_job(job_id)
-
-        # Chỉ QUEUED → RUNNING (tránh ghi đè CANCELLED nếu user vừa dừng)
-        started = (
-            db.query(JobModel)
-            .filter(JobModel.id == job_id, JobModel.status == JobStatus.QUEUED.value)
-            .update(
-                {JobModel.status: JobStatus.RUNNING.value, JobModel.error: None},
-                synchronize_session=False,
-            )
+    if _is_stale_run(job_id, generation):
+        return  # run mới đã tiếp quản — đừng đè trạng thái của nó
+    message = format_error(exc, prefix="Lỗi không mong đợi khi chạy job: ")
+    rows = (
+        db.query(JobModel)
+        .filter(
+            JobModel.id == job_id,
+            JobModel.status.in_([JobStatus.QUEUED.value, JobStatus.RUNNING.value]),
         )
-        if started == 0:
-            fresh = job_repo.get(job_id)
-            if fresh is None or fresh.status == JobStatus.CANCELLED:
-                return
-            # Đã running (resume race) — tiếp tục với status hiện tại
-            if fresh.status != JobStatus.RUNNING:
-                return
-
-        variant_repo.update_status(variant.id, VariantStatus.RUNNING)  # type: ignore[arg-type]
+        .update(
+            {JobModel.status: JobStatus.FAILED.value, JobModel.error: message},
+            synchronize_session=False,
+        )
+    )
+    if not rows:
         db.commit()
-
+        return
+    job = JobRepository(db).get(job_id)
+    variant = VariantRepository(db).get(job.variant_id) if job else None
+    if variant is not None:
+        VariantRepository(db).update_status(variant.id, VariantStatus.FAILED)  # type: ignore[arg-type]
+    db.commit()
+    work = WorkRepository(db).get(variant.work_id) if variant else None
+    if work is not None:
         notify_crawl(
             callback_url=work.callback_url,
             external_id=work.external_id,
-            status="translating",
+            status="failed",
+            message=message,
         )
 
-        # Trích glossary TRƯỚC khi dịch chương nào (chỉ job full đầu tiên của
-        # Work, glossary còn rỗng) — chạy trước khi spawn pool/fallback/single
-        # để MỌI chương của chính job này (dù chương nào do model nào dịch)
-        # đều dùng chung tên nhân vật/địa danh ngay từ đầu.
-        _auto_seed_glossary_pre_translate(
-            db,
-            work=work,
+
+def _refresh_pending_cache_keys(
+    db: Session, *, job_id: int, variant: Variant, work: Work, slots: list[JobProviderSlot]
+) -> None:
+    """Tính lại cache_key segment chưa xong theo glossary HIỆN TẠI — enqueue
+    tính key trước khi `_auto_seed_glossary_pre_translate` thêm thuật ngữ (hoặc
+    user sửa glossary giữa enqueue và resume), nên key cũ mang glossary hash lỗi
+    thời: bản dịch có glossary bị cache dưới key "không glossary"."""
+    job = JobRepository(db).get(job_id)
+    if job is None:
+        return
+    seg_repo = SegmentRepository(db)
+    _, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
+    mphash = make_mode_params_hash(effective_mode_params(db, variant))
+    lang_src = _effective_lang_src(variant, work)
+    multi = len(slots) >= 2
+    # Cùng model "hiệu lực" với translator (_creds_from_job / _bind): model rỗng
+    # → deepseek-chat, nếu không key tính ở đây lệch key run thật tra/ghi.
+    job_model = _creds_from_job(job)[1]
+    slot_models = {s.slot_index: _effective_model(s.model) for s in slots}
+    changed = False
+    for seg in seg_repo.list_by_job(job_id):
+        if seg.status in (SegmentStatus.DONE, SegmentStatus.SKIPPED_CACHE):
+            continue
+        model = slot_models.get(seg.slot_index, job_model) if multi else job_model
+        key = _segment_cache_key(
+            source_text=seg.source_text,
             variant=variant,
-            chapters=chapter_repo.list_by_work(work.id),  # type: ignore[arg-type]
-            job=job,
+            lang_src=lang_src,
+            model=model,
+            ghash=ghash,
+            mphash=mphash,
         )
-
-        if len(slots) >= 2 and job.ai_mode == "pool":
-            threads = [
-                threading.Thread(target=_run_pool_worker, args=(job_id, slot), daemon=True)
-                for slot in slots
-            ]
-            for th in threads:
-                th.start()
-            for th in threads:
-                th.join()
-        elif len(slots) >= 2 and job.ai_mode == "fallback":
-            chapters_by_index = {
-                ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
-            }
-            glossary, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-            mphash = make_mode_params_hash(variant.mode_params)
-            effective_lang_src = _effective_lang_src(variant, work)
-            already_translated = variant.source_variant_id is not None
-            _run_fallback_chain_segments(
-                db,
-                job_id=job_id,
-                variant=variant,
-                chapters_by_index=chapters_by_index,
-                glossary=glossary,
-                ghash=ghash,
-                mphash=mphash,
-                effective_lang_src=effective_lang_src,
-                already_translated=already_translated,
-                slots=slots,
-            )
-        else:
-            chapters_by_index = {
-                ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
-            }
-            glossary, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
-            mphash = make_mode_params_hash(variant.mode_params)
-            effective_lang_src = _effective_lang_src(variant, work)
-            already_translated = variant.source_variant_id is not None
-            _run_single_ai_segments(
-                db,
-                job_id=job_id,
-                variant=variant,
-                chapters_by_index=chapters_by_index,
-                glossary=glossary,
-                ghash=ghash,
-                mphash=mphash,
-                effective_lang_src=effective_lang_src,
-                already_translated=already_translated,
-            )
-
-        job = job_repo.get(job_id)
-        assert job is not None
-        if job.status == JobStatus.CANCELLED:
-            variant_repo.update_status(variant.id, VariantStatus.PENDING)  # type: ignore[arg-type]
-            db.commit()
-            notify_crawl(
-                callback_url=work.callback_url,
-                external_id=work.external_id,
-                status="cancelled",
-                message=job.error,
-            )
-            return
-
-        segments = seg_repo.list_by_job(job_id)
-        failed = sum(1 for s in segments if s.status == SegmentStatus.FAILED)
-        if failed and failed == len(segments):
-            job.status = JobStatus.FAILED
-            job.error = f"Tất cả {failed} segment thất bại"
-            variant_repo.update_status(variant.id, VariantStatus.FAILED)  # type: ignore[arg-type]
-        elif failed:
-            job.status = JobStatus.COMPLETED
-            job.error = f"{failed}/{len(segments)} segment lỗi"
-            variant_repo.update_status(variant.id, VariantStatus.READY)  # type: ignore[arg-type]
-        else:
-            job.status = JobStatus.COMPLETED
-            job.error = None
-            variant_repo.update_status(variant.id, VariantStatus.READY)  # type: ignore[arg-type]
-        job.updated_at = dt.datetime.utcnow()
-        job_repo.update(job)
+        if key != seg.cache_key:
+            seg.cache_key = key
+            seg_repo.update(seg)
+            changed = True
+    if changed:
         db.commit()
 
-        if job.status == JobStatus.COMPLETED and failed == 0:
-            _auto_extract_glossary_if_empty(db, work=work, variant=variant, job=job)
-            _start_pending_forks(db, source_variant_id=variant.id)  # type: ignore[arg-type]
 
-        if job.status == JobStatus.FAILED:
-            notify_crawl(
-                callback_url=work.callback_url,
-                external_id=work.external_id,
-                status="failed",
-                message=job.error,
+def _run_job_inner(db: Session, *, job_id: int, generation: int | None) -> None:
+    from translate.infrastructure.persistence.models import JobModel
+
+    job_repo = JobRepository(db)
+    seg_repo = SegmentRepository(db)
+    variant_repo = VariantRepository(db)
+    work_repo = WorkRepository(db)
+    chapter_repo = ChapterSourceRepository(db)
+
+    job = job_repo.get(job_id)
+    if job is None:
+        return
+    if job.status == JobStatus.CANCELLED:
+        return
+
+    variant = variant_repo.get(job.variant_id)
+    if variant is None:
+        job.status = JobStatus.FAILED
+        job.error = "Variant missing"
+        job_repo.update(job)
+        db.commit()
+        return
+
+    work = work_repo.get(variant.work_id)
+    if work is None:
+        job.status = JobStatus.FAILED
+        job.error = "Work missing"
+        job_repo.update(job)
+        db.commit()
+        return
+
+    slots = JobProviderSlotRepository(db).list_by_job(job_id)
+
+    # Chỉ QUEUED → RUNNING (tránh ghi đè CANCELLED nếu user vừa dừng)
+    started = (
+        db.query(JobModel)
+        .filter(JobModel.id == job_id, JobModel.status == JobStatus.QUEUED.value)
+        .update(
+            {JobModel.status: JobStatus.RUNNING.value, JobModel.error: None},
+            synchronize_session=False,
+        )
+    )
+    if started == 0:
+        fresh = job_repo.get(job_id)
+        if fresh is None or fresh.status == JobStatus.CANCELLED:
+            return
+        # Đã running (resume race) — tiếp tục với status hiện tại
+        if fresh.status != JobStatus.RUNNING:
+            return
+
+    variant_repo.update_status(variant.id, VariantStatus.RUNNING)  # type: ignore[arg-type]
+    db.commit()
+
+    notify_crawl(
+        callback_url=work.callback_url,
+        external_id=work.external_id,
+        status="translating",
+    )
+
+    # Trích glossary TRƯỚC khi dịch chương nào (chỉ job full đầu tiên của
+    # Work, glossary còn rỗng) — chạy trước khi spawn pool/fallback/single
+    # để MỌI chương của chính job này (dù chương nào do model nào dịch)
+    # đều dùng chung tên nhân vật/địa danh ngay từ đầu.
+    _auto_seed_glossary_pre_translate(
+        db,
+        work=work,
+        variant=variant,
+        chapters=chapter_repo.list_by_work(work.id),  # type: ignore[arg-type]
+        job=job,
+        is_cancelled=_job_stop_check(job_repo, job_id, generation),
+    )
+    _auto_generate_skin_map(
+        db, variant=variant, job=job, is_cancelled=_job_stop_check(job_repo, job_id, generation)
+    )
+    # Gắn bảng đổi vỏ (reskin) vào mode_params trong bộ nhớ — vào prompt + QA.
+    variant.mode_params = effective_mode_params(db, variant)
+    _refresh_pending_cache_keys(db, job_id=job_id, variant=variant, work=work, slots=slots)
+
+    if len(slots) >= 2 and job.ai_mode == "pool":
+        threads = [
+            threading.Thread(target=_run_pool_worker, args=(job_id, slot, generation), daemon=True)
+            for slot in slots
+        ]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+    elif len(slots) >= 2 and job.ai_mode == "fallback":
+        chapters_by_index = {
+            ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
+        }
+        glossary, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
+        mphash = make_mode_params_hash(effective_mode_params(db, variant))
+        effective_lang_src = _effective_lang_src(variant, work)
+        already_translated = variant.source_variant_id is not None
+        _run_fallback_chain_segments(
+            db,
+            job_id=job_id,
+            variant=variant,
+            chapters_by_index=chapters_by_index,
+            glossary=glossary,
+            ghash=ghash,
+            mphash=mphash,
+            effective_lang_src=effective_lang_src,
+            already_translated=already_translated,
+            slots=slots,
+            generation=generation,
+        )
+    else:
+        chapters_by_index = {
+            ch.index: ch for ch in chapter_repo.list_by_work(work.id)  # type: ignore[arg-type]
+        }
+        glossary, ghash = _load_glossary_pairs(db, work.id)  # type: ignore[arg-type]
+        mphash = make_mode_params_hash(effective_mode_params(db, variant))
+        effective_lang_src = _effective_lang_src(variant, work)
+        already_translated = variant.source_variant_id is not None
+        _run_single_ai_segments(
+            db,
+            job_id=job_id,
+            variant=variant,
+            chapters_by_index=chapters_by_index,
+            glossary=glossary,
+            ghash=ghash,
+            mphash=mphash,
+            effective_lang_src=effective_lang_src,
+            already_translated=already_translated,
+            generation=generation,
+        )
+
+    if _is_stale_run(job_id, generation):
+        return  # run mới (Resume sau Cancel) lo phần tổng kết
+    db.expire_all()
+    job = job_repo.get(job_id)
+    assert job is not None
+    if job.status == JobStatus.CANCELLED:
+        variant_repo.update_status(variant.id, VariantStatus.PENDING)  # type: ignore[arg-type]
+        db.commit()
+        notify_crawl(
+            callback_url=work.callback_url,
+            external_id=work.external_id,
+            status="cancelled",
+            message=job.error,
+        )
+        return
+
+    progress = seg_repo.progress_summary(job_id)
+    total, failed, pending = progress["total"], progress["failed"], progress["pending"]
+    if pending:
+        # Còn segment chưa chạy mà không ai Cancel (vd worker chết giữa chừng)
+        # — không được báo COMPLETED / READY / chạy fork như đã xong.
+        status, variant_status = JobStatus.FAILED, VariantStatus.FAILED
+        error = f"Chưa xong: {pending}/{total} segment chưa dịch — bấm Resume để chạy tiếp"
+    elif failed and failed == total:
+        status, variant_status = JobStatus.FAILED, VariantStatus.FAILED
+        error = f"Tất cả {failed} segment thất bại"
+    elif failed:
+        status, variant_status = JobStatus.COMPLETED, VariantStatus.READY
+        error = f"{failed}/{total} segment lỗi"
+    else:
+        status, variant_status, error = JobStatus.COMPLETED, VariantStatus.READY, None
+    if not _finalize_job(
+        db,
+        job_id=job_id,
+        generation=generation,
+        variant_id=variant.id,  # type: ignore[arg-type]
+        status=status,
+        error=error,
+        variant_status=variant_status,
+    ):
+        return  # run mới đã tiếp quản, hoặc job vừa bị dừng
+
+    if status == JobStatus.COMPLETED and failed == 0:
+        job = job_repo.get(job_id) or job
+        _auto_extract_glossary_if_empty(
+            db, work=work, variant=variant, job=job, is_cancelled=lambda: _is_stale_run(job_id, generation)
+        )
+        _start_pending_forks(db, source_variant_id=variant.id)  # type: ignore[arg-type]
+
+    notify_crawl(
+        callback_url=work.callback_url,
+        external_id=work.external_id,
+        status="failed" if status == JobStatus.FAILED else "ready_for_video",
+        message=error,
+    )
+
+
+def _finalize_job(
+    db: Session,
+    *,
+    job_id: int,
+    generation: int | None,
+    variant_id: int,
+    status: JobStatus,
+    error: str | None,
+    variant_status: VariantStatus,
+) -> bool:
+    """Ghi kết quả cuối của run. Kiểm generation NGAY trước khi ghi (giữ khoá
+    generation suốt lúc ghi để Resume không chen vào giữa) và chỉ ghi khi job
+    vẫn RUNNING — run cũ chạy chậm không đè được run mới hay Cancel."""
+    from translate.infrastructure.persistence.models import JobModel
+
+    with _run_generation_guard:
+        if generation is not None and _run_generation.get(job_id) != generation:
+            return False
+        rows = (
+            db.query(JobModel)
+            .filter(JobModel.id == job_id, JobModel.status == JobStatus.RUNNING.value)
+            .update(
+                {
+                    JobModel.status: status.value,
+                    JobModel.error: error,
+                    JobModel.updated_at: dt.datetime.utcnow(),
+                },
+                synchronize_session=False,
             )
-        else:
-            notify_crawl(
-                callback_url=work.callback_url,
-                external_id=work.external_id,
-                status="ready_for_video",
-                message=job.error,
-            )
-    finally:
-        db.close()
+        )
+        if rows:
+            VariantRepository(db).update_status(variant_id, variant_status)
+        db.commit()
+    return bool(rows)

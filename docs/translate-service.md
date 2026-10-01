@@ -38,7 +38,7 @@ Quyết định vận hành hiện tại:
 - FE Translate: **có** (`/translate`) — library, modal "Bắt đầu dịch" (chọn AI + full/tóm tắt, tạo variant+job trong 1 bước), Work overview (variant+job list: xóa/tạm dừng/dịch lại), Job Detail riêng (`/translate/:workId/jobs/:jobId`, review + đổi AI giữa job), glossary, settings (registry AI + budget)
 - Job pause: **không phải status mới** — `pause_job()`/`POST /jobs/{id}/pause` dùng lại đúng cơ chế `cancel_job` (CANCELLED, resumable qua `resume_job`), chỉ đổi message hiển thị. Xem mục 4.4.
 - Crawl CTA **Gửi sang dịch** + callback `translating` / `ready_for_video`: **có** — FE crawl gọi handoff với `start_job: false` (mặc định mới), **không** tự chạy job; landing trên `/translate/:workId` sẽ tự mở modal "Bắt đầu dịch" để user chọn AI/mode trước. Backend `send_to_translate(start_job=True)` vẫn giữ để tương thích, chỉ không còn là default phía FE.
-- EPUB import: **chưa** (P5)
+- EPUB import và export bản dịch: **có**. Polish opt-in (`mode_params.polish`, mặc định tắt): **có**. TTS là service riêng (`tts-service`). Video: chưa.
 
 ---
 
@@ -369,7 +369,7 @@ Crawl lifecycle gợi ý (không bắt translate phụ thuộc enum crawl): sau 
 | **P2** | Handoff crawl UI + gate + callback lifecycle | Nối pipeline farm | **done** (2026-09-22) |
 | **P3** | Variants: `pov`, `audio_cut`, `style_clone` + clone UI | USP audio/video | **done** (2026-09-22) |
 | **P4** | Fingerprint sync, export JSON TTS-ready, Inbox | Vận hành hàng ngày | **done** (2026-09-22) |
-| **P5** | Polish/QA opt-in, EPUB bilingual (nếu cần) | Parity cao cấp | pending |
+| **P5** | Polish opt-in, EPUB import/export, EPUB song ngữ đã có | Parity cao cấp | một phần |
 
 ---
 

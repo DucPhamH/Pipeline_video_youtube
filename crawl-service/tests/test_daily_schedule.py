@@ -35,7 +35,9 @@ def test_sites_due_empty_when_nothing_enabled():
     assert due == []
 
 
-def test_sites_due_only_matching_time_and_enabled():
+def test_sites_due_when_time_reached_and_enabled():
+    """Đến hạn khi now >= giờ hẹn hôm nay (không đòi khớp đúng phút) —
+    c (7:00) bị tick trễ lúc 7:30 vẫn chạy; b (8:30) chưa tới giờ."""
     due = sites_due_now(
         now=dt.datetime(2026, 9, 18, 7, 30),
         source_keys=["a", "b", "c"],
@@ -47,7 +49,161 @@ def test_sites_due_only_matching_time_and_enabled():
             genre={"a": "hot", "b": "hot", "c": "hot"},
         ),
     )
-    assert due == [("a", "hot")]
+    assert due == [("a", "hot"), ("c", "hot")]
+
+
+def test_sites_due_skips_when_persisted_last_fired_is_today():
+    due = sites_due_now(
+        now=dt.datetime(2026, 9, 18, 9, 0),
+        source_keys=["a", "b"],
+        already_fired=set(),
+        get_last_fired=lambda sk: {"a": "2026-09-18", "b": "2026-09-17"}[sk],
+        **_cfg(enabled={"a": True, "b": True}, genre={"a": "hot", "b": "hot"}),
+    )
+    assert due == [("b", "hot")]
+
+
+def test_tick_dispatches_in_background_without_persisting_last_fired(client, monkeypatch):  # noqa: ARG001
+    """Tick chỉ đánh dấu in-process; last_fired trong DB ghi khi crawl THẬT SỰ
+    bắt đầu (trong _run_due_sites, sau khi lấy được khoá)."""
+    import threading
+
+    from platform_ import scheduler
+    from platform_.db import SessionLocal
+    from platform_.settings_store import get_setting, per_site_key, set_setting
+
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_run(due, today=None):
+        calls.append(due)
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(scheduler, "_run_due_sites", fake_run)
+    monkeypatch.setattr(scheduler, "scheduler_now", lambda: dt.datetime(2026, 9, 18, 23, 0))
+    monkeypatch.setattr(scheduler, "_fired_dates", set())
+    sk = "bqgxs_com"
+    db = SessionLocal()
+    try:
+        set_setting(db, per_site_key("daily_enabled", sk), True)
+        set_setting(db, per_site_key("daily_genre_key", sk), "xuanhuan")
+        set_setting(db, scheduler.last_fired_key(sk), "")
+    finally:
+        db.close()
+    try:
+        threads = scheduler.run_daily_crawl_tick()
+        assert started.wait(5)
+        assert threads and threads[0].is_alive()  # tick đã trả về, crawl vẫn đang chạy nền
+        assert (sk, "xuanhuan") in calls[0]
+        db = SessionLocal()
+        try:
+            assert get_setting(db, scheduler.last_fired_key(sk)) == ""
+        finally:
+            db.close()
+        # Tick sau cùng ngày (cùng process) không dispatch lại
+        assert scheduler.run_daily_crawl_tick() == []
+    finally:
+        release.set()
+        db = SessionLocal()
+        try:
+            set_setting(db, per_site_key("daily_enabled", sk), False)
+            set_setting(db, per_site_key("daily_genre_key", sk), "")
+        finally:
+            db.close()
+
+
+def _daily_genre(db, sk: str):
+    from crawl.infrastructure.persistence.repositories import SqlAlchemyGenreRepository
+
+    return SqlAlchemyGenreRepository(db).get_or_create(sk, "daily_lf_test", "Daily LF", "https://x/list")
+
+
+def test_run_due_sites_marks_last_fired_only_when_crawl_starts(client, monkeypatch):  # noqa: ARG001
+    from crawl.application.dto import CrawlGenreResult
+    from platform_ import scheduler
+    from platform_.db import SessionLocal
+    from platform_.locks import release, try_acquire
+    from platform_.settings_store import get_setting, set_setting
+
+    sk = "bgq99_cc"
+    db = SessionLocal()
+    try:
+        genre = _daily_genre(db, sk)
+        set_setting(db, scheduler.last_fired_key(sk), "")
+    finally:
+        db.close()
+    ran: list[int] = []
+
+    def fake_execute(self, genre_id):
+        ran.append(genre_id)
+        return CrawlGenreResult(genre_id=genre_id)
+
+    monkeypatch.setattr(scheduler.CrawlGenreUseCase, "execute", fake_execute)
+    monkeypatch.setattr(scheduler, "_fired_dates", {(sk, "2026-09-18")})
+
+    # Đang có lượt khác giữ khoá -> không chạy, KHÔNG ghi last_fired, bỏ dấu in-process.
+    lock = f"genre-run:{genre.id}"
+    assert try_acquire(lock)
+    try:
+        scheduler._run_due_sites([(sk, "daily_lf_test")], today="2026-09-18")
+    finally:
+        release(lock)
+    db = SessionLocal()
+    try:
+        assert get_setting(db, scheduler.last_fired_key(sk)) == ""
+    finally:
+        db.close()
+    assert ran == []
+    assert (sk, "2026-09-18") not in scheduler._fired_dates
+
+    scheduler._run_due_sites([(sk, "daily_lf_test")], today="2026-09-18")
+    assert ran == [genre.id]
+    db = SessionLocal()
+    try:
+        assert get_setting(db, scheduler.last_fired_key(sk)) == "2026-09-18"
+    finally:
+        db.close()
+
+
+def test_seed_last_fired_when_schedule_enabled_after_hour(client):  # noqa: ARG001
+    from platform_ import scheduler
+    from platform_.db import SessionLocal
+    from platform_.settings_store import get_setting, per_site_key, set_setting
+
+    sk = "fsshu_com"
+    db = SessionLocal()
+    try:
+        set_setting(db, per_site_key("daily_enabled", sk), True)
+        set_setting(db, per_site_key("daily_hour", sk), 6)
+        set_setting(db, per_site_key("daily_minute", sk), 0)
+        # Trước giờ hẹn -> không seed (vẫn chạy hôm nay đúng giờ)
+        assert scheduler.seed_last_fired_if_past(db, sk, now=dt.datetime(2026, 9, 18, 5, 0)) is False
+        # Sau giờ hẹn -> seed hôm nay, không quét ngay
+        assert scheduler.seed_last_fired_if_past(db, sk, now=dt.datetime(2026, 9, 18, 9, 0)) is True
+        assert get_setting(db, scheduler.last_fired_key(sk)) == "2026-09-18"
+        # Startup chỉ seed site CHƯA có key nào
+        assert sk not in scheduler.seed_last_fired_on_startup(db, now=dt.datetime(2026, 9, 19, 9, 0))
+    finally:
+        set_setting(db, per_site_key("daily_enabled", sk), False)
+        db.close()
+
+
+def test_settings_hide_last_fired_keys(client):
+    from platform_ import scheduler
+    from platform_.db import SessionLocal
+    from platform_.settings_store import set_setting
+
+    db = SessionLocal()
+    try:
+        set_setting(db, scheduler.last_fired_key("bqgxs_com"), "2026-09-18")
+    finally:
+        db.close()
+    values = client.get("/api/crawl/settings").json()["values"]
+    assert not any(k.startswith("scheduler.daily_last_fired.") for k in values)
+    r = client.patch("/api/crawl/settings", json={"values": {scheduler.last_fired_key("bqgxs_com"): "x"}})
+    assert r.status_code == 422
 
 
 def test_sites_due_skips_missing_genre_key():

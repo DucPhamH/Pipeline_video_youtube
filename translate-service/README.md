@@ -13,7 +13,7 @@ Mode trên một Work: `full`, `pov`, `audio_cut`, `style_clone`. Ba mode sau
 dịch từ bản `full` đã xong, không dịch lại từ nguồn. `audio_cut` chạy hai
 lượt (giữ beat, rồi rút).
 
-Chưa có: import EPUB, TTS, ghép video.
+Import EPUB, xuất EPUB bản dịch, và EPUB song ngữ (nguồn cạnh bản dịch). Lượt sửa câu (`polish`) tắt mặc định. Đọc audio nằm ở `tts-service`. Chưa ghép video.
 
 ## Chạy local
 
@@ -31,6 +31,35 @@ API prefix: `/api/translate` — docs: http://localhost:8010/docs
 
 Docker Compose ở gốc repo map cổng host `8010`. UI production đi qua nginx
 `/api/translate/`, không gọi thẳng cổng này.
+
+**Chỉ chạy 1 worker/process** (uvicorn mặc định, không `--workers N`, không
+gunicorn nhiều worker). Thread dịch, "generation" chống 2 run cùng 1 job sau
+Cancel→Resume, và giãn cách gọi AI đều nằm trong bộ nhớ process — nhiều worker
+sẽ chạy trùng job và vượt rate-limit.
+
+## Bảo mật
+
+- `FOLIO_API_TOKEN` (tùy chọn): khi đặt, mọi route trừ `/api/health` và
+  `/api/translate/health` cần header `X-Folio-Token: <token>` hoặc
+  `Authorization: Bearer <token>`; GET (vd tải export) nhận thêm `?token=`.
+  Sai/thiếu → 401. Callback sang crawl-service gửi kèm `X-Folio-Token`. Để trống
+  → không kiểm tra, log cảnh báo lúc khởi động (chỉ dùng trong mạng tin cậy).
+- `TRANSLATE_MAX_UPLOAD_MB` (mặc định 50): giới hạn file EPUB / văn bản TXT
+  import (413 nếu vượt). `TRANSLATE_MAX_EPUB_UNCOMPRESSED_MB` (mặc định 500):
+  chặn EPUB giải nén quá lớn (zip bomb).
+- Đổi `base_url` của AI đã lưu sang host khác phải gửi kèm `api_key`/`api_keys`
+  mới trong cùng request (422 nếu không) — tránh gửi key cũ tới server lạ.
+- `segment.error` lưu dạng `[code] thông điệp` đã che key, bỏ query string, cắt
+  ngắn. `code`: `rate_limited`, `auth`, `too_large`, `truncated`, `network`,
+  `refusal`, `worker_crashed`, `provider_error`.
+
+## QA output
+
+Sau mỗi segment chạy kiểm tra luật rẻ, lưu ở `qa_flags` (segment) và
+`flagged_segments` (job): `untranslated` (còn nhiều chữ CJK), `length_ratio`,
+`repetition`, `polish_failed` — segment vẫn DONE. `refusal` (model từ chối) →
+segment FAILED, không cache. `POST /api/translate/jobs/{id}/retranslate-flagged?flag=X`
+đưa segment có cờ X (bỏ trống = mọi cờ) về pending và chạy tiếp.
 
 ## Test
 

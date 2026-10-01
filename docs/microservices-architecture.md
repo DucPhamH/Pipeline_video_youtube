@@ -1,7 +1,8 @@
 # Kiến trúc Microservices — cách các service sau này ghép với nhau
 
+> Sản phẩm tên **Folio**. Repo vẫn nằm trong thư mục `Crawl/`.
 > Trả lời câu hỏi: "làm sao để thành microservices". Tài liệu này áp dụng
-> cho toàn bộ hệ thống (Crawl/Translate/TTS/Video), không riêng 1 service.
+> cho toàn bộ hệ thống (crawl / translate / TTS / video), không riêng 1 service.
 
 ## 1. Nguyên tắc cốt lõi
 
@@ -17,7 +18,9 @@ Crawl/                          (repo gốc, monorepo chứa nhiều service)
 ├── crawl-service/                ĐÃ CODE — [crawl-overview.md](./crawl-overview.md)
 ├── translate-service/            ĐÃ CODE — [translate-service.md](./translate-service.md)
 ├── frontend/                     ĐÃ CODE — Sites, novel, /translate
-├── tts-service/                  chưa có
+├── tts-service/                  ĐÃ CODE — import TXT/EPUB, giọng Edge, mp3/m4b
+├── write-service/                ĐÃ CODE — truyện mới, gọi ai-service
+├── ai-service/                   ĐÃ CODE — nhà AI và chat, các service khác gọi vào
 └── video-service/                chưa có
 ```
 
@@ -54,8 +57,8 @@ không start job). Translate lưu Work trong DB của nó. Job chạy xong thì
 gọi ngược `POST /api/crawl/novels/{id}/translate-lifecycle`
 (`translating` / `ready_for_video` / `failed`).
 
-TTS và video chưa có. Khi có, chúng đọc file export của translate, không
-mở DB của service trước.
+TTS nhận chương đã dịch bằng `POST /api/tts/works/from-translate` (frontend
+gọi khi user bấm trên job dịch). TTS không mở DB của translate. Video chưa có.
 
 ## 4. Vì sao Crawl service ĐÃ SẴN SÀNG cho microservices mà không cần sửa
 
@@ -74,14 +77,14 @@ tạo thư mục mới cùng khuôn và để chúng gọi API của nhau.
 
 ## 5. `docker-compose.yml` — chạy nhiều service cùng lúc
 
-File ở gốc repo đã có ba service: `crawl-service` (host `8090`),
-`translate-service` (host `8010`, `CRAWL_SERVICE_URL=http://crawl-service:8000`),
-và `frontend` (nginx, host `5173`). Thêm TTS/video sau này là thêm một
-block, không sửa DB của service đã có.
+Compose chạy crawl (`8090`), translate (`8010`), TTS (`8011`), write (`8012`),
+ai (`8013`) và frontend (nginx, `5173`). Nhà AI nằm ở `ai-service`. Dịch, viết
+và đọc gọi vào đó. Thêm video sau này là thêm một block, không sửa DB của
+service đã có.
 
 ## 6. Việc chưa làm
 
-- Chưa có `tts-service` / `video-service`.
+- Chưa có `video-service`. TTS đã có service riêng.
 - Translate chưa import EPUB (P5 trong spec). Polish/QA opt-in chưa làm.
 - Đã có: handoff crawl, callback lifecycle, registry nhiều AI, pool/fallback,
   glossary, review, export TXT/JSON, UI `/translate`.

@@ -43,9 +43,49 @@ from crawl.domain.services import (
     matches_narration_filter,
     validate_chapter_content,
 )
+from crawl.domain.urls import chapter_url_key, host_matches_source, novel_url_variants, normalize_novel_url
 from crawl.domain.value_objects import ChapterRef
 
 logger = logging.getLogger("crawl")
+
+# Chương coi là "đã có nội dung" — resume/sync bỏ qua; failed/pending thì thử lại.
+DONE_CHAPTER_STATUSES = frozenset(
+    {ChapterStatus.CRAWLED, ChapterStatus.TRANSLATING, ChapterStatus.TRANSLATED}
+)
+
+def toc_has_unsaved_chapters(chapters: list[ChapterRef], saved_rows: list[Chapter]) -> bool:
+    """Mục lục site có chương nào CHƯA có nội dung trong DB không — so theo
+    khoá URL chương (không theo last_chapter_index: dữ liệu cũ từng lưu TOC
+    còn trùng khối "最新章节" nên index bị thổi phồng). Không URL nào khớp
+    (site đổi domain/cấu trúc URL) thì so số chương đã xong."""
+    done = [c for c in saved_rows if c.status in DONE_CHAPTER_STATUSES]
+    saved_keys = {chapter_url_key(c.source_url) for c in done if c.source_url}
+    toc_keys = [chapter_url_key(c.url) for c in chapters]
+    if saved_keys and not saved_keys.intersection(toc_keys):
+        return len(chapters) > len(done)
+    return any(k not in saved_keys for k in toc_keys)
+
+
+def url_host_error(source: SourcePort, url: str) -> str | None:
+    """URL người dùng dán (thêm tay / dry-run) phải thuộc domain của nguồn
+    (base_url + www./m./wap. + mirror) — chặn SSRF và gửi cookie site sang
+    host lạ. Nguồn không có base_url (demo_local) tự kiểm đường dẫn riêng."""
+    cfg = getattr(source, "cfg", None)
+    base_url = getattr(cfg, "base_url", "") or ""
+    if not base_url:
+        return None
+    mirrors = tuple(getattr(cfg, "mirror_hosts", ()) or ())
+    if not host_matches_source(url, base_url, mirrors):
+        key = getattr(source, "key", "")
+        return f"URL không thuộc site '{key}' ({base_url}) — chỉ nhận link của đúng site này"
+    return None
+
+
+def _reload_novel(novel_repo: NovelRepository, novel_id: int) -> Novel | None:
+    """Đọc lại novel từ DB (bỏ qua identity map) — thread khác có thể vừa đổi trạng thái."""
+    getter = getattr(novel_repo, "get_fresh", None) or novel_repo.get_by_id
+    return getter(novel_id)
+
 
 _NARRATION_FILTER_LABELS = {"first_person": 'ngôi thứ nhất ("tôi")', "third_person": "ngôi thứ ba"}
 
@@ -270,6 +310,51 @@ class CrawlNovelUseCase:
         on_progress: ProgressCallback | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> CrawlNovelResult:
+        """Bọc `_execute_inner` — exception bất ngờ (bug parser, lỗi DB…)
+        không được để novel kẹt "crawling" mãi (Retry chỉ nhận error/
+        fully_crawled): rollback rồi đánh dấu error kèm lý do."""
+        from platform_.run_cancel import cancel_scope
+
+        try:
+            with cancel_scope(should_stop):
+                return self._execute_inner(
+                    novel_id,
+                    prefetched_chapters,
+                    incremental=incremental,
+                    on_progress=on_progress,
+                    should_stop=should_stop,
+                )
+        except Exception as exc:
+            logger.exception("Lỗi không mong đợi khi crawl novel %s", novel_id)
+            msg = f"Lỗi không mong đợi: {exc}"
+            self._mark_error_after_crash(novel_id, msg)
+            return CrawlNovelResult.failure(novel_id, msg)
+
+    def _mark_error_after_crash(self, novel_id: int, msg: str) -> None:
+        for repo in (self.chapter_repo, self.novel_repo):
+            db = getattr(repo, "db", None)
+            if db is not None:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        try:
+            novel = self.novel_repo.get_by_id(novel_id)
+            if novel is not None:
+                novel.mark_error(msg)
+                self.novel_repo.update(novel)
+        except Exception:
+            logger.exception("Không ghi được trạng thái error cho novel %s", novel_id)
+
+    def _execute_inner(
+        self,
+        novel_id: int,
+        prefetched_chapters: list[ChapterRef] | None,
+        *,
+        incremental: bool,
+        on_progress: ProgressCallback | None,
+        should_stop: Callable[[], bool] | None,
+    ) -> CrawlNovelResult:
         report = on_progress or self.on_progress
         stop_check = should_stop
         novel = self.novel_repo.get_by_id(novel_id)
@@ -319,7 +404,58 @@ class CrawlNovelUseCase:
         self.novel_repo.update(novel, commit=True)
         emit(phase="crawling", chapter_index=novel.last_chapter_index, chapter_total=len(chapters))
 
-        already_saved = {c.chapter_index for c in self.chapter_repo.list_by_novel(novel.id)}
+        existing_rows = {c.chapter_index: c for c in self.chapter_repo.list_by_novel(novel.id)}
+        # Chỉ chương đã crawl OK mới là "xong" — chương failed/pending được thử lại.
+        already_saved = {i for i, c in existing_rows.items() if c.status in DONE_CHAPTER_STATUSES}
+        saved_url_keys = {
+            chapter_url_key(c.source_url)
+            for c in existing_rows.values()
+            if c.status in DONE_CHAPTER_STATUSES and c.source_url
+        }
+        next_free_index = max(existing_rows, default=0)
+        done_refs: set[int] = set()  # ref.index (theo TOC lần này) đã có nội dung
+        toc_url_keys = {chapter_url_key(c.url) for c in chapters}
+
+        def ref_is_saved(ref: ChapterRef) -> bool:
+            key = chapter_url_key(ref.url)
+            if key and key in saved_url_keys:
+                return True
+            row = existing_rows.get(ref.index)
+            if ref.index not in already_saved or row is None:
+                return False
+            # Cùng vị trí nhưng khác URL: nếu URL của row cũ thuộc về 1 ref
+            # KHÁC trong TOC lần này (TOC dịch chuyển / trùng khối "最新章节")
+            # thì row đó không phải chương này. Còn lại (site đổi domain…)
+            # giữ hành vi cũ: coi vị trí đã lưu là xong.
+            return chapter_url_key(row.source_url) not in toc_url_keys
+
+        self._sync_toc_order(chapters, existing_rows, toc_url_keys)
+
+        def record_failed(ref: ChapterRef, reason: str) -> None:
+            """Lưu chương lỗi thành row `failed` — FE lọc/retry từng chương."""
+            row = existing_rows.get(ref.index)
+            try:
+                if row is not None:
+                    if row.status in DONE_CHAPTER_STATUSES:
+                        return  # vị trí đã có chương khác OK — không ghi đè
+                    row.mark_failed(reason)
+                    row.toc_order = ref.index
+                    self.chapter_repo.update(row, commit=True)
+                else:
+                    failed = Chapter(
+                        id=None, novel_id=novel.id, chapter_index=ref.index,
+                        title=ref.title, source_url=ref.url, toc_order=ref.index,
+                    )
+                    failed.mark_failed(reason)
+                    existing_rows[ref.index] = self.chapter_repo.add(failed, commit=True)
+            except DuplicateError:
+                pass
+            except Exception:
+                logger.warning(
+                    "Không lưu được trạng thái failed cho chương %s novel %s",
+                    ref.index, novel.id, exc_info=True,
+                )
+
         crawled_count = 0
         pending_since_commit = 0
         consecutive_block_failures = 0
@@ -343,7 +479,8 @@ class CrawlNovelUseCase:
                 return CrawlNovelResult.failure(
                     novel_id, msg, chapters_crawled=crawled_count, cancelled=True
                 )
-            if ref.index in already_saved:
+            if ref_is_saved(ref):
+                done_refs.add(ref.index)
                 continue  # đã có trong DB — resume không nhảy qua lỗ nhờ last_chapter_index
             attempted_new = True
             emit(
@@ -355,6 +492,9 @@ class CrawlNovelUseCase:
             try:
                 text = source.fetch_chapter_content(ref.url)
             except ScrapeError as exc:
+                if stop_check and stop_check():
+                    continue  # bị hủy giữa lúc chờ retry — đầu vòng sau xử lý hủy
+                record_failed(ref, str(exc))
                 consecutive_block_failures, pending_since_commit, fail = _skip_chapter_and_maybe_stop(
                     novel=novel,
                     ref=ref,
@@ -376,6 +516,7 @@ class CrawlNovelUseCase:
             ok, reason = validate_chapter_content(text, locale=_content_locale(source))
             if not ok:
                 assert reason is not None
+                record_failed(ref, reason)
                 consecutive_block_failures, pending_since_commit, fail = _skip_chapter_and_maybe_stop(
                     novel=novel,
                     ref=ref,
@@ -392,14 +533,35 @@ class CrawlNovelUseCase:
                 continue
 
             consecutive_block_failures = 0
-            raw_path = self.storage.save(novel.id, ref.index, text)
-            chapter = Chapter(
-                id=None, novel_id=novel.id, chapter_index=ref.index, title=ref.title, source_url=ref.url,
-            )
-            chapter.mark_crawled(raw_path)
+            target_index = ref.index
+            row = existing_rows.get(ref.index)
+            if row is not None and row.status in DONE_CHAPTER_STATUSES:
+                # Vị trí này đã là 1 chương KHÁC (TOC dịch chuyển) — lưu ở
+                # index trống kế tiếp thay vì đụng unique (novel_id, index).
+                next_free_index = max(next_free_index, ref.index) + 1
+                target_index = next_free_index
+                row = None
+            raw_path = self.storage.save(novel.id, target_index, text)
+            # Nội dung mới — bản cleaned cũ (nếu có) không còn khớp.
+            self.storage.discard_cleaned(raw_path)
             try:
-                self.chapter_repo.add(chapter, commit=True)
-                already_saved.add(ref.index)
+                if row is not None:
+                    row.title = ref.title
+                    row.source_url = ref.url
+                    row.toc_order = ref.index
+                    row.mark_crawled(raw_path)
+                    self.chapter_repo.update(row, commit=True)
+                else:
+                    chapter = Chapter(
+                        id=None, novel_id=novel.id, chapter_index=target_index,
+                        title=ref.title, source_url=ref.url, toc_order=ref.index,
+                    )
+                    chapter.mark_crawled(raw_path)
+                    existing_rows[target_index] = self.chapter_repo.add(chapter, commit=True)
+                    next_free_index = max(next_free_index, target_index)
+                already_saved.add(target_index)
+                saved_url_keys.add(chapter_url_key(ref.url))
+                done_refs.add(ref.index)
             except DuplicateError:
                 # Race condition: 1 request khác (vd job lịch + bấm tay
                 # cùng lúc) đã crawl xong đúng chương này rồi — không phải
@@ -410,6 +572,9 @@ class CrawlNovelUseCase:
                     "Chương %s của novel %s đã được crawl bởi request khác, bỏ qua", ref.index, novel.id
                 )
                 already_saved.add(ref.index)
+                done_refs.add(ref.index)
+            # Theo vị trí TOC (ref.index), không theo target_index — chương lưu
+            # ở index trống cuối không được đẩy last_chapter_index vượt số chương thật.
             novel.advance_chapter(ref.index)
             self.novel_repo.update(novel, commit=True)
             crawled_count += 1
@@ -422,7 +587,10 @@ class CrawlNovelUseCase:
             emit(phase="error", chapter_total=len(chapters), message=msg)
             return CrawlNovelResult.failure(novel_id, msg, chapters_crawled=0)
 
-        missing = [c.index for c in chapters if c.index not in already_saved]
+        # Chuẩn hoá con trỏ resume theo TOC hiện tại (dữ liệu cũ có thể đã bị
+        # thổi phồng bởi TOC trùng khối "最新章节" / chèn ở index trống cuối).
+        novel.last_chapter_index = max(done_refs, default=0)
+        missing = [c.index for c in chapters if c.index not in done_refs]
         if missing:
             msg = (
                 f"Thiếu {len(missing)} chương (vd {missing[0]}"
@@ -462,12 +630,42 @@ class CrawlNovelUseCase:
         )
         return CrawlNovelResult(novel_id=novel_id, chapters_crawled=crawled_count, success=True)
 
+    def _sync_toc_order(
+        self,
+        chapters: list[ChapterRef],
+        existing_rows: dict[int, Chapter],
+        toc_url_keys: set[str],
+    ) -> None:
+        """Ghi vị trí TOC hiện tại (`toc_order`) cho chương đã có — đọc/xuất
+        sắp theo cột này, chương chèn giữa TOC (lưu ở index trống cuối) vẫn
+        đúng chỗ. Khớp theo URL; row có URL không còn trong TOC (site đổi
+        domain) thì khớp theo vị trí."""
+        by_key: dict[str, list[Chapter]] = {}
+        for row in existing_rows.values():
+            key = chapter_url_key(row.source_url)
+            if key:
+                by_key.setdefault(key, []).append(row)
+        dirty = False
+        for ref in chapters:
+            rows = by_key.get(chapter_url_key(ref.url))
+            if not rows:
+                row = existing_rows.get(ref.index)
+                moved = row is not None and chapter_url_key(row.source_url) not in toc_url_keys
+                rows = [row] if moved else []
+            for row in rows:
+                if row.toc_order != ref.index:
+                    row.toc_order = ref.index
+                    self.chapter_repo.update(row, commit=False)
+                    dirty = True
+        if dirty:
+            self.chapter_repo.commit()
+
     def _apply_content_fingerprint(self, novel: Novel) -> None:
         """Hash vài chương đầu — cảnh báo nếu trùng nội dung với truyện khác."""
         assert novel.id is not None
         chapters = sorted(
             (c for c in self.chapter_repo.list_by_novel(novel.id) if c.raw_path),
-            key=lambda c: c.chapter_index,
+            key=lambda c: c.sort_key,
         )[:3]
         texts: list[str] = []
         for ch in chapters:
@@ -546,14 +744,17 @@ class CrawlGenreUseCase:
                     status=GenreRunStatus.ERROR, discovered=0, rejected=0, errors=1,
                     messages=result.messages,
                 )
-                self.genre_repo.update(genre)
+                self.genre_repo.update_run_state(genre)
             return result
 
         if genre.last_run_status != GenreRunStatus.RUNNING:
             genre.mark_run_started()
-            self.genre_repo.update(genre)
+            self.genre_repo.update_run_state(genre)
+        from platform_.run_cancel import cancel_scope, is_cancelled
+
         try:
-            self._scan(genre, result)
+            with cancel_scope(lambda: is_cancelled(genre_id)):
+                self._scan(genre, result)
         except Exception as exc:
             # An toàn cho tiến trình chạy nền/job lịch — không để crash bất
             # ngờ khiến trạng thái kẹt mãi ở "running".
@@ -603,7 +804,7 @@ class CrawlGenreUseCase:
                     message="; ".join(result.messages[:2]) if result.messages else "xong",
                 )
             )
-        self.genre_repo.update(genre)
+        self.genre_repo.update_run_state(genre)
         return result
 
     def _scan(self, genre: Genre, result: CrawlGenreResult) -> None:
@@ -834,12 +1035,15 @@ class CrawlGenreUseCase:
                         message=p.message or p.phase,
                     )
 
-                crawl_result = self.crawl_novel_use_case.execute(
+                crawl_result = self._crawl_locked(
                     saved.id,
                     prefetched_chapters=chapters,
                     on_progress=_nested,
                     should_stop=should_stop,
                 )
+                if crawl_result is None:
+                    result.messages.append(f"Bỏ qua '{candidate.title}': đang có crawl khác chạy truyện này")
+                    continue
                 if crawl_result.cancelled:
                     if crawl_result.chapters_crawled > 0:
                         result.discovered += 1
@@ -896,7 +1100,41 @@ class CrawlGenreUseCase:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
-        """Truyện từng bị loại — đánh giá lại khi filter/TOC đổi (vd đã hoàn thành)."""
+        """Truyện từng bị loại — đánh giá lại khi filter/TOC đổi (vd đã hoàn thành).
+
+        Giữ khoá `crawl-novel:{id}` (cùng key với router Thử lại/Force-accept)
+        suốt lượt — đang bị giữ thì bỏ qua; đọc lại novel mới nhất trước khi làm."""
+        from platform_.locks import release, try_acquire
+
+        lock_key = f"crawl-novel:{existing.id}"
+        if not try_acquire(lock_key):
+            result.messages.append(f"Bỏ qua re-eval '{candidate.title}': đang có crawl khác chạy truyện này")
+            return consecutive_errors
+        try:
+            fresh = _reload_novel(self.novel_repo, existing.id)
+            if fresh is None or fresh.lifecycle_status != NovelLifecycle.REJECTED:
+                return consecutive_errors
+            return self._reevaluate_rejected_locked(
+                fresh, candidate, source, result, consecutive_errors,
+                max_chapters_per_story, locale, page, emit, should_stop=should_stop,
+            )
+        finally:
+            release(lock_key)
+
+    def _reevaluate_rejected_locked(
+        self,
+        existing: Novel,
+        candidate,
+        source: SourcePort,
+        result: CrawlGenreResult,
+        consecutive_errors: int,
+        max_chapters_per_story: int,
+        locale: str,
+        page: int,
+        emit,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
         emit(
             phase="evaluating",
             page=page,
@@ -967,8 +1205,47 @@ class CrawlGenreUseCase:
         should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """Truyện đã có trong DB — không tính vào scan_window. Nếu mục lục site
-        dài hơn last_chapter_index thì crawl bổ sung chương thiếu (TH 54→55).
-        Trả consecutive_errors mới."""
+        có chương chưa lưu (so URL, không so last_chapter_index) thì crawl bổ
+        sung (TH 54→55). Giữ khoá `crawl-novel:{id}` như router; đang bị giữ
+        thì bỏ qua. Trả consecutive_errors mới."""
+        from platform_.locks import release, try_acquire
+
+        lock_key = f"crawl-novel:{existing.id}"
+        if not try_acquire(lock_key):
+            result.messages.append(f"Bỏ qua sync '{candidate.title}': đang có crawl khác chạy truyện này")
+            return consecutive_errors
+        try:
+            fresh = _reload_novel(self.novel_repo, existing.id)
+            if fresh is None:
+                return consecutive_errors
+            return self._sync_existing_locked(
+                fresh, candidate, source, result, consecutive_errors, should_stop=should_stop
+            )
+        finally:
+            release(lock_key)
+
+    def _crawl_locked(self, novel_id: int, **kwargs) -> CrawlNovelResult | None:
+        """crawl_novel_use_case.execute dưới khoá `crawl-novel:{id}` — None nếu đang bị giữ."""
+        from platform_.locks import release, try_acquire
+
+        lock_key = f"crawl-novel:{novel_id}"
+        if not try_acquire(lock_key):
+            return None
+        try:
+            return self.crawl_novel_use_case.execute(novel_id, **kwargs)
+        finally:
+            release(lock_key)
+
+    def _sync_existing_locked(
+        self,
+        existing: Novel,
+        candidate,
+        source: SourcePort,
+        result: CrawlGenreResult,
+        consecutive_errors: int,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> int:
         if existing.lifecycle_status == NovelLifecycle.REJECTED:
             return consecutive_errors
         if existing.lifecycle_status in (
@@ -988,9 +1265,10 @@ class CrawlGenreUseCase:
             return consecutive_errors + 1
 
         site_total = len(chapters)
-        # ERROR với lỗ chương: luôn thử lại dù TOC không dài hơn last_chapter_index.
+        # ERROR với lỗ chương: luôn thử lại dù TOC không có chương mới.
         needs_hole_retry = existing.lifecycle_status == NovelLifecycle.ERROR
-        if site_total <= existing.last_chapter_index and not needs_hole_retry:
+        saved_rows = self.crawl_novel_use_case.chapter_repo.list_by_novel(existing.id)
+        if not needs_hole_retry and not toc_has_unsaved_chapters(chapters, saved_rows):
             return 0
 
         existing.total_chapters = site_total
@@ -1048,6 +1326,9 @@ class DryRunUseCase:
             source = self.source_resolver(source_key)
         except KeyError as exc:
             return DryRunResult(ok=False, mode=mode, error=str(exc))
+        host_error = url_host_error(source, url)
+        if host_error:
+            return DryRunResult(ok=False, mode=mode, error=host_error)
 
         try:
             if mode == "genre":
@@ -1109,12 +1390,26 @@ class AddManualNovelUseCase:
         self.crawl_novel_use_case = crawl_novel_use_case
         self.source_resolver = source_resolver
 
+    def _find_existing(self, source_key: str, url: str, base_url: str = "") -> Novel | None:
+        """Tra truyện đã có theo mọi biến thể URL tương đương (http/https,
+        "/" cuối, fragment, host www./m. cùng domain nguồn)."""
+        for variant in novel_url_variants(url, base_url=base_url):
+            found = self.novel_repo.get_by_source_url(source_key, variant)
+            if found is not None:
+                return found
+        return None
+
     def execute(self, source_key: str, url: str, *, start_crawl: bool = True) -> CrawlNovelResult:
-        existing = self.novel_repo.get_by_source_url(source_key, url)
+        url = normalize_novel_url(url) or url
+        source = self.source_resolver(source_key)
+        host_error = url_host_error(source, url)
+        if host_error:
+            return CrawlNovelResult.failure(0, host_error)
+        base_url = getattr(getattr(source, "cfg", None), "base_url", "") or ""
+        existing = self._find_existing(source_key, url, base_url)
         if existing is not None:
             return CrawlNovelResult.failure(existing.id, "Truyện này đã có trong hệ thống")
 
-        source = self.source_resolver(source_key)
         resolved_url, chapters, error = self._resolve_chapters(source, source_key, url)
         if error is not None:
             return error
@@ -1150,7 +1445,8 @@ class AddManualNovelUseCase:
         chapters, list_err = try_list_chapters(source, url)
         resolved = source.derive_novel_url(url) or url
         if chapters is not None:
-            existing = self.novel_repo.get_by_source_url(source_key, resolved)
+            base_url = getattr(getattr(source, "cfg", None), "base_url", "") or ""
+            existing = self._find_existing(source_key, resolved, base_url)
             if existing is not None:
                 msg = (
                     "Truyện này đã có trong hệ thống (suy ra từ URL chương)"
@@ -1363,6 +1659,9 @@ class RetryChapterUseCase:
             return ChapterRetryResult.failure(chapter_id, reason, status=chapter.status.value)
 
         raw_path = self.storage.save(novel.id, chapter.chapter_index, text)
+        # Raw vừa tải lại — bản cleaned cũ (reader/export ưu tiên) đã lỗi thời.
+        if self.storage.discard_cleaned(raw_path):
+            chapter.reviewed = False
         chapter.mark_crawled(raw_path)
         self.chapter_repo.update(chapter)
 
@@ -1379,7 +1678,11 @@ class RetryChapterUseCase:
         `error` mãi chỉ vì 1 chương lẻ tẻ trước đây."""
         if novel.total_chapters is None:
             return False
-        saved = {c.chapter_index for c in self.chapter_repo.list_by_novel(novel.id)}
+        saved = {
+            c.chapter_index
+            for c in self.chapter_repo.list_by_novel(novel.id)
+            if c.status in DONE_CHAPTER_STATUSES
+        }
         if len(saved) < novel.total_chapters:
             return False
         if novel.lifecycle_status not in (NovelLifecycle.FULLY_CRAWLED, NovelLifecycle.ERROR):
@@ -1406,7 +1709,11 @@ class SmoothNovelUseCase:
         self.storage = storage
         self.get_opencc_mode = get_opencc_mode or (lambda _source_key: "none")
 
-    def execute(self, novel_id: int, chapter_ids: list[int] | None = None) -> SmoothNovelResult:
+    def execute(
+        self, novel_id: int, chapter_ids: list[int] | None = None, *, force: bool = False
+    ) -> SmoothNovelResult:
+        """Chương đã review/sửa tay (`reviewed=True`) KHÔNG bị làm mượt đè
+        (mất bản sửa) trừ khi `force=True` — đếm vào `chapters_protected`."""
         from crawl.domain.rule_smooth import smooth_chapter_text
 
         novel = self.novel_repo.get_by_id(novel_id)
@@ -1449,6 +1756,7 @@ class SmoothNovelUseCase:
 
         smoothed = 0
         skipped = 0
+        protected = 0
         removed_total = 0
         done_ids: list[int] = []
         dirty = False
@@ -1456,6 +1764,10 @@ class SmoothNovelUseCase:
             for ch in chapters:
                 if not ch.raw_path or ch.status != ChapterStatus.CRAWLED:
                     skipped += 1
+                    continue
+                if ch.reviewed and not force:
+                    skipped += 1
+                    protected += 1
                     continue
                 try:
                     raw = self.storage.read(ch.raw_path)
@@ -1495,6 +1807,7 @@ class SmoothNovelUseCase:
             success=True,
             chapters_smoothed=smoothed,
             chapters_skipped=skipped,
+            chapters_protected=protected,
             removed_lines=removed_total,
             chapter_ids=done_ids,
         )
@@ -1521,12 +1834,15 @@ class DeleteNovelUseCase:
             return DeleteResult(success=False, error="Đang crawl — không xóa được. Đợi xong rồi thử lại.")
 
         chapters = self.chapter_repo.list_by_novel(novel_id)
-        for ch in chapters:
-            self.storage.delete_chapter_files(ch.raw_path)
-        self.storage.delete_novel_dirs(novel_id)
-
+        # DB trước: file mồ côi còn dọn được, dòng DB trỏ vào file đã mất thì mất chữ.
         if not self.novel_repo.delete(novel_id):
             return DeleteResult(success=False, error="Không xóa được novel")
+        try:
+            for ch in chapters:
+                self.storage.delete_chapter_files(ch.raw_path)
+            self.storage.delete_novel_dirs(novel_id)
+        except Exception:
+            logger.exception("Đã xóa novel %s nhưng còn sót file trên đĩa", novel_id)
         return DeleteResult(success=True)
 
 
@@ -1558,8 +1874,10 @@ class DeleteChapterUseCase:
             return DeleteResult(success=False, error="Không xóa được chương")
 
         remaining = self.chapter_repo.list_by_novel(chapter.novel_id)
+        # Theo vị trí TOC (không theo chapter_index — chương chèn giữa TOC
+        # nằm ở index trống cuối, không được thổi phồng con trỏ resume).
         crawled_idx = [
-            c.chapter_index for c in remaining if c.status == ChapterStatus.CRAWLED
+            c.sort_key[0] for c in remaining if c.status == ChapterStatus.CRAWLED
         ]
         novel.last_chapter_index = max(crawled_idx) if crawled_idx else 0
         self.novel_repo.update(novel)
@@ -1608,7 +1926,7 @@ class NovelExportUseCase:
     def _rows(self, novel_id: int) -> list:
         from crawl.application.excel_export import ChapterExportRow
 
-        pairs: list[tuple[int, ChapterExportRow]] = []
+        pairs: list[tuple[tuple[int, int], ChapterExportRow]] = []
         for ch in self.chapter_repo.list_by_novel(novel_id):
             if ch.status != ChapterStatus.CRAWLED or not ch.raw_path:
                 continue
@@ -1616,7 +1934,8 @@ class NovelExportUseCase:
                 content, _src = self.storage.read_preferred(ch.raw_path)
             except OSError:
                 content = ""
-            pairs.append((ch.chapter_index, ChapterExportRow(title=ch.title, content=content)))
+            # Thứ tự đọc = vị trí TOC (toc_order), fallback chapter_index.
+            pairs.append((ch.sort_key, ChapterExportRow(title=ch.title, content=content)))
         pairs.sort(key=lambda p: p[0])
         return [row for _, row in pairs]
 

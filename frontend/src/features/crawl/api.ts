@@ -1,4 +1,4 @@
-import { api } from "../../api/client"
+import { api, ApiError } from "../../api/client"
 import type {
   ChapterContent,
   ChapterRetryResult,
@@ -26,6 +26,32 @@ import type {
 } from "../../api/types"
 
 const BASE = "/api/crawl"
+
+export type Pipeline = {
+  novel_id: number
+  title: string
+  stage: "smoothing" | "translating" | "speaking" | "done" | "error" | string
+  voice_preset: string
+  engine: string
+  translate_work_id: number | null
+  tts_work_id: number | null
+  error: string | null
+}
+
+export type Follow = {
+  novel_id: number
+  title: string
+  lifecycle_status: string
+  total_chapters: number | null
+  auto_translate: boolean
+  auto_audio: boolean
+  voice_preset: string
+  tts_work_id: number | null
+  last_checked_at: string | null
+  last_new_chapters: number
+  last_error: string | null
+  checking: boolean
+}
 
 // Khớp platform_/settings_store.py per_site_key() — setting riêng từng site
 // lưu dưới key "crawl.<key>.<source_key>" (mục 9.0).
@@ -108,10 +134,23 @@ export const crawlApi = {
       limit: params.limit ?? 100,
     }),
   forceAcceptNovel: (id: number) => api.post<CrawlNovelResult>(`${BASE}/novels/${id}/force-accept`),
-  smoothNovel: (id: number, chapterIds?: number[]) =>
-    api.post<SmoothNovelResult>(`${BASE}/novels/${id}/smooth`, {
+  // force=true: làm mượt cả chương đã review/sửa tay (ghi đè bản sửa) —
+  // mặc định backend giữ nguyên các chương đó và đếm vào chapters_protected.
+  smoothNovel: (id: number, chapterIds?: number[], force = false) =>
+    api.post<SmoothNovelResult & { chapters_protected?: number }>(`${BASE}/novels/${id}/smooth`, {
       chapter_ids: chapterIds && chapterIds.length > 0 ? chapterIds : null,
+      force,
     }),
+  // Tiến độ live khi crawl 1 truyện (cùng shape genre progress). 404 = backend
+  // cũ chưa có endpoint / truyện mất → coi như không có snapshot.
+  getNovelProgress: async (id: number): Promise<GenreProgressResult> => {
+    try {
+      return await api.get<GenreProgressResult>(`${BASE}/novels/${id}/progress`)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) return { progress: null }
+      throw err
+    }
+  },
   sendToTranslate: (
     id: number,
     opts?: { require_cleaned?: boolean; start_job?: boolean },
@@ -176,4 +215,12 @@ export const crawlApi = {
   // Crawl lại ĐÚNG 1 chương lỗi — khác retryNovel (cả truyện), mục 9.6.
   retryChapter: (chapterId: number) =>
     api.post<ChapterRetryResult>(`${BASE}/chapters/${chapterId}/retry`),
+  listPipelines: () => api.get<{ items: Pipeline[] }>(`${BASE}/pipelines`),
+  startPipeline: (id: number, voicePreset: string) =>
+    api.post<Pipeline>(`${BASE}/novels/${id}/pipeline`, { voice_preset: voicePreset, engine: "edge" }),
+  listFollows: () => api.get<{ items: Follow[] }>(`${BASE}/follows`),
+  follow: (id: number, body: { auto_translate: boolean; auto_audio: boolean; voice_preset: string }) =>
+    api.put<Follow>(`${BASE}/novels/${id}/follow`, body),
+  unfollow: (id: number) => api.delete<void>(`${BASE}/novels/${id}/follow`),
+  checkFollow: (id: number) => api.post<Follow>(`${BASE}/novels/${id}/follow/check`),
 }

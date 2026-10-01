@@ -111,6 +111,9 @@ export interface Novel {
   error_message: string | null
   author?: string
   cover_url?: string
+  /** Số chương đã crawl xong / lỗi (backend mới — có thể không có). */
+  crawled_chapters?: number
+  failed_chapters?: number
 }
 
 export interface NovelListParams {

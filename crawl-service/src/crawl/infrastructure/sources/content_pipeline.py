@@ -6,6 +6,28 @@ from pathlib import Path
 
 from crawl.domain.ports import ScrapeError
 
+class NonRetryableScrapeError(ScrapeError):
+    """Lỗi retry cũng vô ích (404/403, chương VIP khoá) — bỏ qua backoff."""
+
+
+class VipLockedError(NonRetryableScrapeError):
+    """Chương khoá VIP / cần cookie đăng nhập."""
+
+
+class ChallengeError(NonRetryableScrapeError):
+    """Trang Cloudflare/JS-challenge thay cho nội dung thật (chương, mục lục,
+    danh sách) — báo lỗi rõ thay vì parse ra 0 kết quả. Không retry ngay
+    (httpx thường không qua được challenge; cần cookie cf_clearance/tầng browser)."""
+
+
+class RateLimitedError(ScrapeError):
+    """HTTP 429 — `retry_after` (giây) lấy từ header Retry-After nếu có."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 _VIP_LOCK_MARKERS = (
     "您还没有订阅本章节",
     "请登录后在继续阅读",
@@ -21,7 +43,7 @@ _VIP_LOCK_MARKERS = (
 def assert_not_vip_locked(html: str, *, source_key: str, url: str) -> None:
     for marker in _VIP_LOCK_MARKERS:
         if marker in html:
-            raise ScrapeError(
+            raise VipLockedError(
                 f"[{source_key}] Chương khoá VIP/cần cookie đăng nhập "
                 f"(marker={marker!r}) tại {url}"
             )
@@ -35,7 +57,7 @@ def check_fetched_html(html: str, *, source_key: str, url: str) -> None:
     from crawl.infrastructure.sources.tls_fetch import looks_like_cloudflare_challenge
 
     if looks_like_cloudflare_challenge(html):
-        raise ScrapeError(f"[{source_key}] Cloudflare/challenge tại {url}")
+        raise ChallengeError(f"[{source_key}] Cloudflare/challenge tại {url}")
     assert_not_vip_locked(html, source_key=source_key, url=url)
 
 

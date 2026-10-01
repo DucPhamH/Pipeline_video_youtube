@@ -15,6 +15,7 @@ services:
     environment:
       TRANSLATE_SERVICE_URL: http://translate-service:8000
       CRAWL_PUBLIC_URL: http://crawl-service:8000
+      FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
     volumes:
       - crawl_data:/app/data
     restart: unless-stopped
@@ -26,11 +27,17 @@ services:
         # Cùng origin qua nginx proxy — để trống = relative /api
         VITE_API_BASE_URL: ""
         VITE_TRANSLATE_API_BASE_URL: ""
+        VITE_TTS_API_BASE_URL: ""
+        VITE_WRITE_API_BASE_URL: ""
+        VITE_AI_API_BASE_URL: ""
     ports:
       - "${FRONTEND_PORT:-5173}:80"
     depends_on:
       - crawl-service
       - translate-service
+      - tts-service
+      - write-service
+      - ai-service
     restart: unless-stopped
 
   translate-service:
@@ -41,10 +48,13 @@ services:
       - ./translate-service/.env
     environment:
       CRAWL_SERVICE_URL: http://crawl-service:8000
+      AI_API_BASE_URL: http://ai-service:8000
+      FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
     volumes:
       - translate_data:/app/data
     depends_on:
       - crawl-service
+      - ai-service
     # Cho AI local (Ollama/LM Studio) chạy trên máy host — container gọi
     # host.docker.internal thay vì localhost (localhost trong container là
     # chính nó). Docker Desktop (Mac/Windows) đã tự có sẵn; dòng dưới cần
@@ -53,6 +63,53 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  tts-service:
+    build: ./tts-service
+    ports:
+      - "${TTS_SERVICE_PORT:-8011}:8000"
+    env_file:
+      - ./tts-service/.env
+    environment:
+      AI_API_BASE_URL: http://ai-service:8000
+      FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
+    volumes:
+      - tts_data:/app/data
+    depends_on:
+      - ai-service
+    restart: unless-stopped
+
+  write-service:
+    build: ./write-service
+    ports:
+      - "${WRITE_SERVICE_PORT:-8012}:8000"
+    env_file:
+      - ./write-service/.env
+    environment:
+      AI_API_BASE_URL: http://ai-service:8000
+      FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
+    volumes:
+      - write_data:/app/data
+    depends_on:
+      - ai-service
+    restart: unless-stopped
+
+  ai-service:
+    build: ./ai-service
+    ports:
+      - "${AI_SERVICE_PORT:-8013}:8000"
+    env_file:
+      - ./ai-service/.env
+    environment:
+      FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
+    volumes:
+      - ai_data:/app/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
 volumes:
   crawl_data:
   translate_data:
+  tts_data:
+  write_data:
+  ai_data:

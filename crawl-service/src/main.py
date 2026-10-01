@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from sqlalchemy.orm import Session
 
@@ -10,6 +11,7 @@ from crawl.api.routers import router as crawl_router
 from crawl.domain.entities import GenreRunStatus, NovelLifecycle
 from crawl.infrastructure.sources.registry import GENRE_SEEDS, SOURCES, catalog_genre_keys
 from crawl.infrastructure.persistence.repositories import SqlAlchemyGenreRepository, SqlAlchemyNovelRepository
+from platform_.auth import token_auth_middleware, warn_if_open
 from platform_.config import config
 from platform_.db import SessionLocal, init_db
 from platform_.settings_store import PER_SITE_CRAWL_DEFAULTS, per_site_key, seed_defaults, seed_missing
@@ -75,7 +77,7 @@ def _recover_interrupted_genre_runs(genre_repo: SqlAlchemyGenreRepository) -> No
                 status=GenreRunStatus.ERROR, discovered=0, rejected=0, errors=1,
                 messages=["Bị gián đoạn do server khởi động lại giữa lúc đang quét — thử lại sau"],
             )
-            genre_repo.update(genre)
+            genre_repo.update_run_state(genre)
 
 
 def _recover_interrupted_novel_crawls(novel_repo: SqlAlchemyNovelRepository) -> None:
@@ -112,12 +114,17 @@ def _seed_startup_data() -> None:
                 genre_repo.update(genre)
         _recover_interrupted_genre_runs(genre_repo)
         _recover_interrupted_novel_crawls(SqlAlchemyNovelRepository(db))
+        # Deploy đầu: site đã bật lịch mà giờ hẹn hôm nay đã qua -> không quét ngay.
+        from platform_.scheduler import seed_last_fired_on_startup
+
+        seed_last_fired_on_startup(db)
     finally:
         db.close()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    warn_if_open()
     _seed_startup_data()
     from platform_.scheduler import create_scheduler
 
@@ -134,12 +141,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Crawl Service API", lifespan=lifespan)
 
+# Thứ tự: auth thêm TRƯỚC để CORS bọc ngoài cùng — response 401 vẫn có header
+# CORS, preflight OPTIONS không bị đòi token.
+app.add_middleware(BaseHTTPMiddleware, dispatch=token_auth_middleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    # "*" + allow_credentials: Starlette phản hồi đúng header được xin
+    # (gồm X-Folio-Token, Authorization).
+    allow_headers=["*", "X-Folio-Token", "Authorization"],
 )
 
 app.include_router(crawl_router)

@@ -1,17 +1,26 @@
-import { ApiError } from "../../api/client"
+import { aiApi } from "@/features/ai/api"
+import { ApiError, connectionError, responseError } from "../../api/client"
+import { translate } from "@/i18n"
+import { authFetch, saveBlob } from "../../api/authToken"
 import type {
-  AiProvider,
   AiProviderInput,
   Estimate,
   GlossaryTerm,
+  GlossaryTermInput,
   Inbox,
   Job,
   ModelsInfo,
+  NameExtractResult,
+  NameItem,
   ProviderConfig,
+  RenameBatch,
+  RenameResult,
   Segment,
   SegmentDetail,
   SettingsValues,
+  SkinMapRow,
   StyleProfile,
+  UndoResult,
   Variant,
   Work,
   WorkList,
@@ -26,7 +35,7 @@ function translateRoot(): string {
   if (envTranslateBase !== undefined && envTranslateBase !== "") {
     return envTranslateBase.replace(/\/$/, "")
   }
-    if (import.meta.env.DEV) {
+  if (import.meta.env.DEV) {
     return "http://localhost:8010"
   }
   return ""
@@ -36,21 +45,14 @@ async function tRequest<T>(path: string, options?: RequestInit): Promise<T> {
   const root = translateRoot()
   let res: Response
   try {
-    res = await fetch(`${root}${path}`, {
+    res = await authFetch(`${root}${path}`, {
       headers: { "Content-Type": "application/json" },
       ...options,
     })
   } catch {
-    throw new ApiError(
-      `Không kết nối được translate-service (${root || "same-origin"})`,
-      0,
-    )
+    throw connectionError("translate-service", root)
   }
-  if (!res.ok) {
-    const body = await res.json().catch(() => null)
-    const message = body?.detail ?? body?.error ?? `Lỗi HTTP ${res.status}`
-    throw new ApiError(typeof message === "string" ? message : JSON.stringify(message), res.status)
-  }
+  if (!res.ok) throw await responseError(res)
   if (res.status === 204) {
     return undefined as T
   }
@@ -75,11 +77,75 @@ export const translateApi = {
 
   listGlossary: (workId: number) =>
     tRequest<GlossaryTerm[]>(`${BASE}/works/${workId}/glossary`),
-  addGlossary: (
-    workId: number,
-    body: { source_term: string; target_term: string; protected?: boolean; notes?: string },
-  ) =>
+  addGlossary: (workId: number, body: GlossaryTermInput) =>
     tRequest<GlossaryTerm>(`${BASE}/works/${workId}/glossary`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  /** PUT thay cả term (backend bắt buộc source_term) — gửi đủ field hiện có. */
+  updateGlossary: (workId: number, termId: number, body: GlossaryTermInput) =>
+    tRequest<GlossaryTerm>(`${BASE}/works/${workId}/glossary/${termId}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  // Bảng duyệt tên (glossary mở rộng: kind/status + số lần xuất hiện)
+  listNames: (workId: number) => tRequest<NameItem[]>(`${BASE}/works/${workId}/names`),
+  extractNames: (workId: number, body: { provider_id?: number; sample_chapters?: number }) =>
+    tRequest<NameExtractResult>(`${BASE}/works/${workId}/names/extract`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  approveNames: (workId: number, termIds: number[]) =>
+    tRequest<NameItem[]>(`${BASE}/works/${workId}/names/approve`, {
+      method: "POST",
+      body: JSON.stringify({ term_ids: termIds }),
+    }),
+  applyNames: (
+    workId: number,
+    body: {
+      changes: { term_id: number; new_target: string }[]
+      variant_ids?: number[]
+      dry_run: boolean
+    },
+  ) =>
+    tRequest<RenameResult>(`${BASE}/works/${workId}/names/apply`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listRenameBatches: (workId: number) =>
+    tRequest<RenameBatch[]>(`${BASE}/works/${workId}/names/batches`),
+  undoRenameBatch: (workId: number, batchId: number) =>
+    tRequest<UndoResult>(`${BASE}/works/${workId}/names/batches/${batchId}/undo`, { method: "POST" }),
+
+  // Bảng "đổi vỏ" (skin map) của variant reskin
+  listSkinMap: (variantId: number) => tRequest<SkinMapRow[]>(`${BASE}/variants/${variantId}/skin-map`),
+  generateSkinMap: (variantId: number, body: { provider_id?: number; overwrite?: boolean }) =>
+    tRequest<SkinMapRow[]>(`${BASE}/variants/${variantId}/skin-map/generate`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  addSkinMapRow: (variantId: number, body: { original: string; replacement: string; kind?: string }) =>
+    tRequest<SkinMapRow>(`${BASE}/variants/${variantId}/skin-map`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateSkinMapRow: (
+    variantId: number,
+    rowId: number,
+    body: { replacement?: string; kind?: string; locked?: boolean },
+  ) =>
+    tRequest<SkinMapRow>(`${BASE}/variants/${variantId}/skin-map/${rowId}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteSkinMapRow: (variantId: number, rowId: number) =>
+    tRequest<void>(`${BASE}/variants/${variantId}/skin-map/${rowId}`, { method: "DELETE" }),
+  applySkinMap: (
+    variantId: number,
+    body: { changes: { row_id: number; new_replacement: string }[]; dry_run: boolean },
+  ) =>
+    tRequest<RenameResult>(`${BASE}/variants/${variantId}/skin-map/apply`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
@@ -106,8 +172,27 @@ export const translateApi = {
 
   estimate: (variantId: number) =>
     tRequest<Estimate>(`${BASE}/variants/${variantId}/estimate`),
-  estimateWork: (workId: number, mode: string = "full") =>
-    tRequest<Estimate>(`${BASE}/works/${workId}/estimate?mode=${encodeURIComponent(mode)}`),
+  estimateWork: (workId: number, mode: string = "full", polish = false) =>
+    tRequest<Estimate>(
+      `${BASE}/works/${workId}/estimate?mode=${encodeURIComponent(mode)}&polish=${polish ? "true" : "false"}`,
+    ),
+  importEpub: async (body: { file: File; title: string; author: string; lang_src: string }) => {
+    const fd = new FormData()
+    fd.append("file", body.file)
+    fd.append("title", body.title)
+    fd.append("author", body.author)
+    fd.append("lang_src", body.lang_src)
+    fd.append("lang_tgt", "vi")
+    const root = translateRoot()
+    let res: Response
+    try {
+      res = await authFetch(`${root}${BASE}/works/import-epub`, { method: "POST", body: fd })
+    } catch {
+      throw connectionError("translate-service", root)
+    }
+    if (!res.ok) throw await responseError(res)
+    return (await res.json()) as Work
+  },
   listModels: () => tRequest<ModelsInfo>(`${BASE}/models`),
   startJob: (variantId: number, body?: ProviderConfig) =>
     tRequest<Job>(`${BASE}/variants/${variantId}/jobs`, {
@@ -136,6 +221,12 @@ export const translateApi = {
       method: "PATCH",
       body: JSON.stringify({ model }),
     }),
+  /** Reset segment bị QA gắn cờ (lọc theo flag nếu có) rồi chạy tiếp job. */
+  retranslateFlagged: (jobId: number, flag?: string) =>
+    tRequest<Job>(
+      `${BASE}/jobs/${jobId}/retranslate-flagged${flag ? `?flag=${encodeURIComponent(flag)}` : ""}`,
+      { method: "POST" },
+    ),
   listSegments: (jobId: number) =>
     tRequest<Segment[]>(`${BASE}/jobs/${jobId}/segments`),
   getSegment: (segmentId: number) =>
@@ -155,54 +246,41 @@ export const translateApi = {
 
   exportTxt: async (variantId: number) => {
     const root = translateRoot()
-    const res = await fetch(`${root}${BASE}/variants/${variantId}/export.txt`)
+    const res = await authFetch(`${root}${BASE}/variants/${variantId}/export.txt`)
     if (!res.ok) {
-      throw new ApiError(`Export failed ${res.status}`, res.status)
+      throw new ApiError(translate("app.exportFailed", { status: res.status }), res.status)
     }
     const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `variant-${variantId}.txt`
-    a.click()
-    URL.revokeObjectURL(url)
+    saveBlob(blob, `variant-${variantId}.txt`)
   },
 
   exportJson: async (variantId: number) => {
     const root = translateRoot()
-    const res = await fetch(`${root}${BASE}/variants/${variantId}/export.json`)
+    const res = await authFetch(`${root}${BASE}/variants/${variantId}/export.json`)
     if (!res.ok) {
-      throw new ApiError(`Export failed ${res.status}`, res.status)
+      throw new ApiError(translate("app.exportFailed", { status: res.status }), res.status)
     }
     const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement("a")
-    a.href = url
-    a.download = `variant-${variantId}.json`
-    a.click()
-    URL.revokeObjectURL(url)
+    saveBlob(blob, `variant-${variantId}.json`)
   },
 
-  listAiProviders: () => tRequest<AiProvider[]>(`${BASE}/ai-providers`),
-  createAiProvider: (body: AiProviderInput) =>
-    tRequest<AiProvider>(`${BASE}/ai-providers`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
-  updateAiProvider: (id: number, body: Partial<AiProviderInput>) =>
-    tRequest<AiProvider>(`${BASE}/ai-providers/${id}`, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
-  deleteAiProvider: (id: number) =>
-    tRequest<void>(`${BASE}/ai-providers/${id}`, { method: "DELETE" }),
-  addAiProviderKey: (id: number, api_key: string) =>
-    tRequest<AiProvider>(`${BASE}/ai-providers/${id}/keys`, {
-      method: "POST",
-      body: JSON.stringify({ api_key }),
-    }),
-  deleteAiProviderKey: (id: number, index: number) =>
-    tRequest<AiProvider>(`${BASE}/ai-providers/${id}/keys/${index}`, { method: "DELETE" }),
+  exportEpub: async (variantId: number, bilingual = false) => {
+    const root = translateRoot()
+    const q = bilingual ? "?bilingual=true" : ""
+    const res = await authFetch(`${root}${BASE}/variants/${variantId}/export.epub${q}`)
+    if (!res.ok) {
+      throw new ApiError(translate("app.exportFailed", { status: res.status }), res.status)
+    }
+    const blob = await res.blob()
+    saveBlob(blob, bilingual ? `variant-${variantId}.bilingual.epub` : `variant-${variantId}.epub`)
+  },
+
+  listAiProviders: () => aiApi.listProviders(),
+  createAiProvider: (body: AiProviderInput) => aiApi.createProvider(body),
+  updateAiProvider: (id: number, body: Partial<AiProviderInput>) => aiApi.updateProvider(id, body),
+  deleteAiProvider: (id: number) => aiApi.deleteProvider(id),
+  addAiProviderKey: (id: number, api_key: string) => aiApi.addProviderKey(id, api_key),
+  deleteAiProviderKey: (id: number, index: number) => aiApi.deleteProviderKey(id, index),
 
   getInbox: () => tRequest<Inbox>(`${BASE}/inbox`),
 }

@@ -32,7 +32,7 @@ def test_mark_translating_from_discovered_raises():
     n = _novel(lifecycle_status=NovelLifecycle.DISCOVERED)
     try:
         n.mark_translating()
-        assert False, "expected DomainError"
+        raise AssertionError("expected DomainError")
     except DomainError:
         pass
 

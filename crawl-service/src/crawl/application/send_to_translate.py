@@ -1,7 +1,7 @@
 """Gửi novel đã crawl sang translate-service (HTTP, không share DB)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from sqlalchemy.orm import Session
@@ -26,7 +26,29 @@ class SendToTranslateResult:
     missing_cleaned: int
     unreviewed: int
     created: bool
+    # Work đã tạo nhưng start job lỗi — novel VẪN đánh dấu translating (đã
+    # handoff); caller báo lỗi rõ kèm work_id để chạy lại job bên translate.
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def service_auth_headers() -> dict[str, str]:
+    """Header token khi gọi service khác (FOLIO_API_TOKEN dùng chung)."""
+    token = (config.folio_api_token or "").strip()
+    return {"X-Folio-Token": token} if token else {}
+
+
+def _handoff_warnings(db: Session, novel: Novel) -> list[str]:
+    warnings: list[str] = []
+    if novel.lifecycle_status == NovelLifecycle.ERROR:
+        warnings.append(f"Truyện đang ở trạng thái lỗi: {novel.error_message or 'không rõ'}")
+    elif novel.error_message:
+        warnings.append(novel.error_message)
+    counts = SqlAlchemyChapterRepository(db).count_status_by_novels([novel.id]).get(novel.id, {})
+    failed = counts.get(ChapterStatus.FAILED.value, 0)
+    if failed:
+        warnings.append(f"Còn {failed} chương lỗi (failed) — bản dịch sẽ thiếu các chương này")
+    return warnings
 
 
 def _build_handoff_payload(db: Session, novel: Novel, *, prefer_cleaned: bool = True) -> dict:
@@ -66,6 +88,8 @@ def _build_handoff_payload(db: Session, novel: Novel, *, prefer_cleaned: bool = 
         out_chapters.append(
             {
                 "index": ch.chapter_index,
+                # Thứ tự đọc (vị trí TOC) — index giữ làm định danh ổn định.
+                "order": ch.sort_key[0],
                 "title": ch.title,
                 "text": text,
                 "fingerprint": content_fingerprint(text),
@@ -130,8 +154,11 @@ def send_to_translate(
     if not base:
         raise ValueError("TRANSLATE_SERVICE_URL chưa cấu hình")
 
+    warnings = _handoff_warnings(db, novel)
+    job_id: int | None = None
+    job_error: str | None = None
     try:
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=120.0, headers=service_auth_headers()) as client:
             r = client.post(f"{base}/api/translate/works/from-crawl", json=payload)
             if r.status_code >= 400:
                 raise ValueError(f"translate from-crawl: {r.status_code} {r.text[:300]}")
@@ -142,21 +169,34 @@ def send_to_translate(
                 raise ValueError("translate không trả variant")
             variant_id = int(variants[0]["id"])
             created = bool(work.get("external_id"))
-            job_id: int | None = None
             if start_job:
-                jr = client.post(f"{base}/api/translate/variants/{variant_id}/jobs")
-                if jr.status_code >= 400:
-                    raise ValueError(f"translate start job: {jr.status_code} {jr.text[:300]}")
-                job_id = int(jr.json()["id"])
+                # Work ĐÃ tạo bên translate — lỗi từ đây không được làm mất
+                # dấu handoff (novel vẫn chuyển translating, báo lỗi job rõ).
+                try:
+                    jr = client.post(f"{base}/api/translate/variants/{variant_id}/jobs")
+                    if jr.status_code >= 400:
+                        job_error = f"{jr.status_code} {jr.text[:300]}"
+                    else:
+                        job_id = int(jr.json()["id"])
+                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                    job_error = str(exc)
     except httpx.HTTPError as exc:
         raise ValueError(f"Không kết nối translate-service ({base}): {exc}") from exc
 
-    try:
-        novel.mark_translating()
-    except DomainError as exc:
-        raise ValueError(str(exc)) from exc
-    novel_repo.update(novel)
-    db.commit()
+    if novel.lifecycle_status != NovelLifecycle.TRANSLATING:
+        try:
+            novel.mark_translating()
+        except DomainError as exc:
+            raise ValueError(str(exc)) from exc
+        novel_repo.update(novel)
+        db.commit()
+
+    error = None
+    if job_error:
+        error = (
+            f"Đã gửi truyện sang dịch (Work #{work_id}) nhưng không start được job dịch: "
+            f"{job_error} — mở /translate/{work_id} để chạy lại job"
+        )
 
     return SendToTranslateResult(
         novel=novel,
@@ -166,6 +206,8 @@ def send_to_translate(
         missing_cleaned=missing,
         unreviewed=unreviewed,
         created=created,
+        error=error,
+        warnings=warnings,
     )
 
 

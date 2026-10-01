@@ -2,7 +2,7 @@
 SQLAlchemy — map 2 chiều ORM model <-> domain entity."""
 import time
 
-from sqlalchemy import tuple_
+from sqlalchemy import func, tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -10,6 +10,12 @@ from crawl.domain.entities import Chapter, ChapterStatus, Genre, GenreRunStatus,
 from crawl.domain.ports import DuplicateError
 from crawl.infrastructure.persistence.models import ChapterModel, GenreModel, NovelModel
 from platform_.db import is_sqlite_locked
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """UNIQUE (trùng bản ghi) khác FK/NOT NULL — chỉ UNIQUE mới là DuplicateError."""
+    msg = str(getattr(exc, "orig", exc) or exc).lower()
+    return "unique" in msg or "duplicate key" in msg
 
 
 def _retry_locked(op_name: str, fn, *, retries: int = 10):
@@ -63,6 +69,7 @@ def _chapter_to_entity(m: ChapterModel) -> Chapter:
         source_url=m.source_url, raw_path=m.raw_path, status=ChapterStatus(m.status),
         error_message=m.error_message, queued_for_translate=m.queued_for_translate,
         reviewed=m.reviewed, created_at=m.created_at,
+        toc_order=getattr(m, "toc_order", None),
     )
 
 
@@ -170,6 +177,31 @@ class SqlAlchemyGenreRepository:
 
         _retry_locked("genre.update", _do)
 
+    def update_run_state(self, genre: Genre) -> None:
+        """Chỉ ghi các cột last_run_* — lượt quét chạy hàng phút, không được
+        ghi đè `enabled` người dùng vừa đổi trong lúc đó (bản `genre` trong
+        tay use case đọc từ lúc bắt đầu quét)."""
+        def _do() -> None:
+            m = self.db.get(GenreModel, genre.id)
+            if m is None:
+                return
+            # Đọc lại từ DB — tránh identity map trả object cũ.
+            self.db.refresh(m)
+            m.last_run_status = genre.last_run_status.value
+            m.last_run_started_at = genre.last_run_started_at
+            m.last_run_finished_at = genre.last_run_finished_at
+            m.last_run_discovered = genre.last_run_discovered
+            m.last_run_rejected = genre.last_run_rejected
+            m.last_run_errors = genre.last_run_errors
+            m.last_run_messages = genre.last_run_messages
+            try:
+                self.db.commit()
+            except OperationalError:
+                self.db.rollback()
+                raise
+
+        _retry_locked("genre.update_run_state", _do)
+
     def get_or_create(
         self,
         source_key: str,
@@ -204,6 +236,11 @@ class SqlAlchemyNovelRepository:
 
     def get_by_id(self, novel_id: int) -> Novel | None:
         m = self.db.get(NovelModel, novel_id)
+        return _novel_to_entity(m) if m else None
+
+    def get_fresh(self, novel_id: int) -> Novel | None:
+        """Như get_by_id nhưng đọc lại từ DB (bỏ qua identity map của session)."""
+        m = self.db.get(NovelModel, novel_id, populate_existing=True)
         return _novel_to_entity(m) if m else None
 
     def get_by_source_url(self, source_key: str, source_url: str) -> Novel | None:
@@ -290,6 +327,8 @@ class SqlAlchemyNovelRepository:
                 self.db.commit()
             except IntegrityError as exc:
                 self.db.rollback()
+                if not _is_unique_violation(exc):
+                    raise
                 raise DuplicateError(
                     f"Novel (source_key={novel.source_key}, source_url={novel.source_url}) đã tồn tại"
                 ) from exc
@@ -393,7 +432,10 @@ class SqlAlchemyChapterRepository:
     ) -> list[Chapter]:
         q = self._filtered_query(
             novel_id, status=status, search=search, reviewed=reviewed
-        ).order_by(ChapterModel.chapter_index)
+        ).order_by(
+            func.coalesce(ChapterModel.toc_order, ChapterModel.chapter_index),
+            ChapterModel.chapter_index,
+        )
         if limit is not None:
             q = q.offset(offset).limit(limit)
         return [_chapter_to_entity(m) for m in q.all()]
@@ -410,13 +452,28 @@ class SqlAlchemyChapterRepository:
             novel_id, status=status, search=search, reviewed=reviewed
         ).count()
 
+    def count_status_by_novels(self, novel_ids: list[int]) -> dict[int, dict[str, int]]:
+        """{novel_id: {status: số chương}} — 1 query GROUP BY cho cả trang list."""
+        if not novel_ids:
+            return {}
+        rows = (
+            self.db.query(ChapterModel.novel_id, ChapterModel.status, func.count(ChapterModel.id))
+            .filter(ChapterModel.novel_id.in_(novel_ids))
+            .group_by(ChapterModel.novel_id, ChapterModel.status)
+            .all()
+        )
+        out: dict[int, dict[str, int]] = {}
+        for novel_id, status, n in rows:
+            out.setdefault(novel_id, {})[status] = int(n)
+        return out
+
     def add(self, chapter: Chapter, *, commit: bool = True) -> Chapter:
         def _do() -> Chapter:
             m = ChapterModel(
                 novel_id=chapter.novel_id, chapter_index=chapter.chapter_index, title=chapter.title,
                 source_url=chapter.source_url, raw_path=chapter.raw_path, status=chapter.status.value,
                 error_message=chapter.error_message, queued_for_translate=chapter.queued_for_translate,
-                reviewed=chapter.reviewed,
+                reviewed=chapter.reviewed, toc_order=chapter.toc_order,
             )
             self.db.add(m)
             try:
@@ -426,6 +483,8 @@ class SqlAlchemyChapterRepository:
                     self.db.flush()
             except IntegrityError as exc:
                 self.db.rollback()
+                if not _is_unique_violation(exc):
+                    raise
                 raise DuplicateError(
                     f"Chapter (novel_id={chapter.novel_id}, chapter_index={chapter.chapter_index}) đã tồn tại"
                 ) from exc
@@ -444,11 +503,14 @@ class SqlAlchemyChapterRepository:
             m = self.db.get(ChapterModel, chapter.id)
             if m is None:
                 return
+            m.title = chapter.title
+            m.source_url = chapter.source_url
             m.raw_path = chapter.raw_path
             m.status = chapter.status.value
             m.error_message = chapter.error_message
             m.queued_for_translate = chapter.queued_for_translate
             m.reviewed = chapter.reviewed
+            m.toc_order = chapter.toc_order
             if commit:
                 try:
                     self.db.commit()

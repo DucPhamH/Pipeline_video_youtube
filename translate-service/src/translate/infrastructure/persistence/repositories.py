@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from translate.domain.entities import (
@@ -13,6 +14,7 @@ from translate.domain.entities import (
     JobProviderSlot,
     JobStatus,
     Segment,
+    SkinMapEntry,
     SegmentStatus,
     SourceType,
     Variant,
@@ -26,9 +28,12 @@ from translate.infrastructure.persistence.models import (
     GlossaryTermModel,
     JobModel,
     JobProviderSlotModel,
+    NameApplyBatchModel,
+    NameApplyRowModel,
     SegmentModel,
     TranslationCacheModel,
     VariantModel,
+    VariantSkinMapModel,
     WorkModel,
 )
 
@@ -135,7 +140,22 @@ def _segment_to_entity(m: SegmentModel) -> Segment:
         reviewed=bool(m.reviewed),
         slot_index=getattr(m, "slot_index", None) or 0,
         story_state=getattr(m, "story_state", None) or "",
+        qa_flags=_load_qa_flags(getattr(m, "qa_flags", None)),
     )
+
+
+def _load_qa_flags(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in data] if isinstance(data, list) else []
+
+
+def _dump_qa_flags(flags: list[str] | None) -> str | None:
+    return json.dumps(list(flags)) if flags else None
 
 
 def _job_provider_slot_to_entity(m: JobProviderSlotModel) -> JobProviderSlot:
@@ -161,6 +181,8 @@ def _glossary_to_entity(m: GlossaryTermModel) -> GlossaryTerm:
         target_term=m.target_term or "",
         protected=bool(m.protected),
         notes=m.notes or "",
+        kind=getattr(m, "kind", None) or "",
+        status=getattr(m, "status", None) or "approved",
     )
 
 
@@ -336,6 +358,37 @@ class JobRepository:
         m = self.db.get(JobModel, job_id)
         return _job_to_entity(m) if m else None
 
+    def get_status(self, job_id: int) -> JobStatus | None:
+        """Đọc status TƯƠI từ DB — `db.get` trả object trong identity map (không
+        SELECT lại nếu chưa commit/expire), nên worker chờ lâu giữa 2 commit sẽ
+        không thấy Cancel của request khác. Query theo cột luôn chạy SQL."""
+        raw = self.db.query(JobModel.status).filter(JobModel.id == job_id).scalar()
+        return JobStatus(raw) if raw is not None else None
+
+    def has_active_for_variant(self, variant_id: int) -> bool:
+        """Có job QUEUED/RUNNING nào của variant không — đọc tươi từ DB."""
+        return (
+            self.db.query(JobModel.id)
+            .filter(
+                JobModel.variant_id == variant_id,
+                JobModel.status.in_((JobStatus.QUEUED.value, JobStatus.RUNNING.value)),
+            )
+            .first()
+            is not None
+        )
+
+    def latest_output_job_for_variant(self, variant_id: int) -> Job | None:
+        """Job mà export đọc: completed gần nhất; chưa có thì job gần nhất."""
+        m = (
+            self.db.query(JobModel)
+            .filter(JobModel.variant_id == variant_id, JobModel.status == JobStatus.COMPLETED.value)
+            .order_by(JobModel.id.desc())
+            .first()
+        )
+        if m is None:
+            return self.latest_for_variant(variant_id)
+        return _job_to_entity(m)
+
     def latest_for_variant(self, variant_id: int) -> Job | None:
         m = (
             self.db.query(JobModel)
@@ -379,6 +432,7 @@ class SegmentRepository:
                 reviewed=1 if seg.reviewed else 0,
                 slot_index=seg.slot_index,
                 story_state=seg.story_state,
+                qa_flags=_dump_qa_flags(seg.qa_flags),
             )
             self.db.add(m)
             self.db.flush()
@@ -407,6 +461,45 @@ class SegmentRepository:
         )
         return _segment_to_entity(m) if m else None
 
+    def progress_summary(self, job_id: int) -> dict:
+        """Đếm tiến độ bằng GROUP BY — không nạp source/output text của mọi
+        segment (poll job mỗi giây với sách vài nghìn chương)."""
+        counts = dict(
+            self.db.query(SegmentModel.status, func.count(SegmentModel.id))
+            .filter(SegmentModel.job_id == job_id)
+            .group_by(SegmentModel.status)
+            .all()
+        )
+        first_pending = (
+            self.db.query(func.min(SegmentModel.chapter_index))
+            .filter(SegmentModel.job_id == job_id, SegmentModel.status == SegmentStatus.PENDING.value)
+            .scalar()
+        )
+        max_attempted_slot = (
+            self.db.query(func.max(func.coalesce(SegmentModel.slot_index, 0)))
+            .filter(SegmentModel.job_id == job_id, SegmentModel.status != SegmentStatus.PENDING.value)
+            .scalar()
+        )
+        flagged = (
+            self.db.query(func.count(SegmentModel.id))
+            .filter(
+                SegmentModel.job_id == job_id,
+                SegmentModel.qa_flags.isnot(None),
+                SegmentModel.qa_flags != "[]",
+            )
+            .scalar()
+        )
+        return {
+            "total": sum(counts.values()),
+            "pending": counts.get(SegmentStatus.PENDING.value, 0),
+            "flagged": flagged or 0,
+            "done": counts.get(SegmentStatus.DONE.value, 0)
+            + counts.get(SegmentStatus.SKIPPED_CACHE.value, 0),
+            "failed": counts.get(SegmentStatus.FAILED.value, 0),
+            "first_pending_chapter": first_pending,
+            "max_attempted_slot": max_attempted_slot,
+        }
+
     def list_by_job_and_slot(self, job_id: int, slot_index: int) -> list[Segment]:
         rows = (
             self.db.query(SegmentModel)
@@ -427,6 +520,7 @@ class SegmentRepository:
         m.reviewed = 1 if seg.reviewed else 0
         m.slot_index = seg.slot_index
         m.story_state = seg.story_state
+        m.qa_flags = _dump_qa_flags(seg.qa_flags)
         self.db.flush()
 
 
@@ -454,6 +548,8 @@ class GlossaryRepository:
             target_term=term.target_term.strip(),
             protected=1 if term.protected else 0,
             notes=term.notes or "",
+            kind=term.kind or "",
+            status=term.status or "approved",
         )
         self.db.add(m)
         self.db.flush()
@@ -468,6 +564,8 @@ class GlossaryRepository:
         m.target_term = term.target_term.strip()
         m.protected = 1 if term.protected else 0
         m.notes = term.notes or ""
+        m.kind = term.kind or ""
+        m.status = term.status or "approved"
         self.db.flush()
 
     def delete(self, term_id: int) -> bool:
@@ -489,10 +587,32 @@ class TranslationCacheRepository:
 
     def put(self, key: str, output_text: str) -> None:
         m = self.db.get(TranslationCacheModel, key)
-        if m is None:
-            self.db.add(TranslationCacheModel(cache_key=key, output_text=output_text))
-        else:
+        if m is not None:
             m.output_text = output_text
+            self.db.flush()
+            return
+        # Upsert: 2 worker pool (session khác nhau) có thể cùng dịch 1 nội dung
+        # → cùng cache_key; `add` thuần sẽ IntegrityError ở worker ghi sau.
+        dialect = self.db.get_bind().dialect.name
+        if dialect in ("sqlite", "postgresql"):
+            if dialect == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert
+            else:
+                from sqlalchemy.dialects.postgresql import insert
+            stmt = insert(TranslationCacheModel).values(cache_key=key, output_text=output_text)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[TranslationCacheModel.cache_key],
+                set_={"output_text": stmt.excluded.output_text},
+            )
+            self.db.execute(stmt)
+            return
+        self.db.add(TranslationCacheModel(cache_key=key, output_text=output_text))
+        self.db.flush()
+
+    def delete(self, key: str) -> None:
+        self.db.query(TranslationCacheModel).filter(TranslationCacheModel.cache_key == key).delete(
+            synchronize_session=False
+        )
         self.db.flush()
 
 
@@ -600,4 +720,169 @@ class JobProviderSlotRepository:
         m.requires_api_key = 1 if slot.requires_api_key else 0
         m.label = slot.label or ""
         m.ai_provider_id = slot.ai_provider_id
+        self.db.flush()
+
+
+def _skin_to_entity(m: VariantSkinMapModel) -> SkinMapEntry:
+    return SkinMapEntry(
+        id=m.id,
+        variant_id=m.variant_id,
+        original=m.original,
+        replacement=m.replacement or "",
+        kind=m.kind or "",
+        locked=bool(m.locked),
+    )
+
+
+class SkinMapRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def list_by_variant(self, variant_id: int) -> list[SkinMapEntry]:
+        rows = (
+            self.db.query(VariantSkinMapModel)
+            .filter(VariantSkinMapModel.variant_id == variant_id)
+            .order_by(VariantSkinMapModel.id)
+            .all()
+        )
+        return [_skin_to_entity(m) for m in rows]
+
+    def get(self, row_id: int) -> SkinMapEntry | None:
+        m = self.db.get(VariantSkinMapModel, row_id)
+        return _skin_to_entity(m) if m else None
+
+    def add(self, e: SkinMapEntry) -> SkinMapEntry:
+        m = VariantSkinMapModel(
+            variant_id=e.variant_id,
+            original=e.original.strip(),
+            replacement=e.replacement.strip(),
+            kind=e.kind or "",
+            locked=1 if e.locked else 0,
+        )
+        self.db.add(m)
+        self.db.flush()
+        e.id = m.id
+        return e
+
+    def update(self, e: SkinMapEntry) -> None:
+        m = self.db.get(VariantSkinMapModel, e.id)
+        if m is None:
+            return
+        m.original = e.original.strip()
+        m.replacement = e.replacement.strip()
+        m.kind = e.kind or ""
+        m.locked = 1 if e.locked else 0
+        self.db.flush()
+
+    def delete(self, row_id: int) -> bool:
+        m = self.db.get(VariantSkinMapModel, row_id)
+        if m is None:
+            return False
+        self.db.delete(m)
+        self.db.flush()
+        return True
+
+    def delete_by_variant(self, variant_id: int) -> None:
+        self.db.query(VariantSkinMapModel).filter(VariantSkinMapModel.variant_id == variant_id).delete(
+            synchronize_session=False
+        )
+        self.db.flush()
+
+
+class NameApplyBatchRepository:
+    """Lô áp tên (glossary/skin_map) + snapshot output từng segment để Undo."""
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def add(
+        self,
+        *,
+        work_id: int,
+        variant_id: int | None,
+        kind: str,
+        changes: list[dict],
+        rows: list[tuple[int, str, str]],
+    ) -> int:
+        b = NameApplyBatchModel(
+            work_id=work_id,
+            variant_id=variant_id,
+            kind=kind,
+            changes_json=json.dumps(changes, ensure_ascii=False),
+        )
+        self.db.add(b)
+        self.db.flush()
+        for segment_id, old, new in rows:
+            self.db.add(
+                NameApplyRowModel(batch_id=b.id, segment_id=segment_id, old_output=old, new_output=new)
+            )
+        self.db.flush()
+        return b.id
+
+    @staticmethod
+    def _batch_dict(b: NameApplyBatchModel, segments: int) -> dict:
+        try:
+            changes = json.loads(b.changes_json or "[]")
+        except (TypeError, ValueError):
+            changes = []
+        return {
+            "id": b.id,
+            "work_id": b.work_id,
+            "variant_id": b.variant_id,
+            "kind": b.kind,
+            "created_at": b.created_at,
+            "changes": changes if isinstance(changes, list) else [],
+            "segments": segments,
+        }
+
+    def get(self, batch_id: int) -> dict | None:
+        b = self.db.get(NameApplyBatchModel, batch_id)
+        if b is None:
+            return None
+        return self._batch_dict(b, self._row_count(batch_id))
+
+    def _row_count(self, batch_id: int) -> int:
+        return (
+            self.db.query(func.count(NameApplyRowModel.id))
+            .filter(NameApplyRowModel.batch_id == batch_id)
+            .scalar()
+            or 0
+        )
+
+    def list_by_work(self, work_id: int, *, limit: int = 20) -> list[dict]:
+        rows = (
+            self.db.query(NameApplyBatchModel)
+            .filter(NameApplyBatchModel.work_id == work_id)
+            .order_by(NameApplyBatchModel.id.desc())
+            .limit(limit)
+            .all()
+        )
+        return [self._batch_dict(b, self._row_count(b.id)) for b in rows]
+
+    def rows(self, batch_id: int) -> list[tuple[int, str, str]]:
+        rows = (
+            self.db.query(NameApplyRowModel)
+            .filter(NameApplyRowModel.batch_id == batch_id)
+            .order_by(NameApplyRowModel.id)
+            .all()
+        )
+        return [(r.segment_id, r.old_output or "", r.new_output or "") for r in rows]
+
+    def delete(self, batch_id: int) -> None:
+        self.db.query(NameApplyRowModel).filter(NameApplyRowModel.batch_id == batch_id).delete(
+            synchronize_session=False
+        )
+        self.db.query(NameApplyBatchModel).filter(NameApplyBatchModel.id == batch_id).delete(
+            synchronize_session=False
+        )
+        self.db.flush()
+
+    def delete_by_work(self, work_id: int) -> None:
+        for (bid,) in self.db.query(NameApplyBatchModel.id).filter(NameApplyBatchModel.work_id == work_id):
+            self.db.query(NameApplyRowModel).filter(NameApplyRowModel.batch_id == bid).delete(
+                synchronize_session=False
+            )
+        self.db.query(NameApplyBatchModel).filter(NameApplyBatchModel.work_id == work_id).delete(
+            synchronize_session=False
+        )
         self.db.flush()

@@ -32,6 +32,13 @@ function detectLocale(): Locale {
   return "vi"
 }
 
+/** Translator dùng ngoài React (tầng API) — bám theo locale provider đang chọn. */
+let activeT: TranslateFn = createTranslator(LOCALES[detectLocale()], vi)
+
+export function translate(key: string, vars?: Record<string, string | number>): string {
+  return activeT(key, vars)
+}
+
 type I18nContextValue = {
   locale: Locale
   setLocale: (locale: Locale) => void
@@ -57,6 +64,10 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   }, [locale])
 
   const t = useMemo(() => createTranslator(LOCALES[locale], vi), [locale])
+
+  useEffect(() => {
+    activeT = t
+  }, [t])
 
   const value = useMemo(() => ({ locale, setLocale, t }), [locale, setLocale, t])
 

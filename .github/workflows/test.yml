@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Crawl tests
+        working-directory: crawl-service
+        run: |
+          python -m pip install -r requirements-dev.txt
+          PYTHONPATH=src python -m pytest -q
+      - name: Translate tests
+        working-directory: translate-service
+        run: |
+          python -m pip install -r requirements-dev.txt
+          PYTHONPATH=src python -m pytest -q
+      - name: AI tests
+        working-directory: ai-service
+        run: |
+          python -m pip install -r requirements-dev.txt
+          PYTHONPATH=src python -m pytest -q
+      - name: Write tests
+        working-directory: write-service
+        run: |
+          python -m pip install -r requirements-dev.txt
+          PYTHONPATH=src python -m pytest -q
+      - name: TTS tests
+        working-directory: tts-service
+        run: |
+          python -m pip install -r requirements-dev.txt
+          PYTHONPATH=src python -m pytest -q

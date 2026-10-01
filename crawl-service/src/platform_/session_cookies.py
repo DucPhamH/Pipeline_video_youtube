@@ -101,7 +101,19 @@ def save_cookie_header(source_key: str, cookie_header: str, db: Session | None =
             db.close()
 
 
+def cookie_hint(raw: str | None) -> str:
+    """Gợi ý ngắn, KHÔNG lộ giá trị: số cookie + vài tên đầu."""
+    cookies = parse_cookie_header(raw)
+    if not cookies:
+        return ""
+    names = sorted(cookies)
+    shown = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+    return f"{len(names)} cookie ({shown})"
+
+
 def session_status(source_key: str, db: Session | None = None) -> dict[str, Any]:
+    """Trạng thái phiên cho API — KHÔNG trả giá trị cookie (`cookie_header`
+    luôn rỗng; đọc giá trị thật qua `load_cookie_header` ở server)."""
     raw = load_cookie_header(source_key, db=db)
     cookies = parse_cookie_header(raw)
     required = required_cookie_names(source_key)
@@ -117,7 +129,9 @@ def session_status(source_key: str, db: Session | None = None) -> dict[str, Any]
         "source_key": source_key,
         "configured": configured,
         "cookie_names": sorted(cookies.keys()),
-        "cookie_header": raw,
+        "cookie_header": "",
+        "has_cookie": bool(cookies),
+        "cookie_hint": cookie_hint(raw),
         "required_cookies": required,
         "missing_required_cookies": missing,
     }

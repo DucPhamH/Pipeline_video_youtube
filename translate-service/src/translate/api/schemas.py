@@ -1,6 +1,8 @@
 """Pydantic request/response schemas."""
 from __future__ import annotations
 
+import datetime as dt
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -149,6 +151,8 @@ class JobOut(BaseModel):
     done_segments: int = 0
     total_segments: int = 0
     failed_segments: int = 0
+    # Số segment bị QA luật rẻ gắn cờ (xem SegmentOut.qa_flags).
+    flagged_segments: int = 0
     current_chapter: int | None = None
     ai_provider_id: int | None = None
     ai_mode: str = "single"
@@ -229,6 +233,7 @@ class SegmentOut(BaseModel):
     error: str | None = None
     output_preview: str = ""
     reviewed: bool = False
+    qa_flags: list[str] = Field(default_factory=list)
 
 
 class SegmentDetailOut(BaseModel):
@@ -242,6 +247,7 @@ class SegmentDetailOut(BaseModel):
     output_text: str | None = None
     error: str | None = None
     reviewed: bool = False
+    qa_flags: list[str] = Field(default_factory=list)
 
 
 class SegmentPutIn(BaseModel):
@@ -254,6 +260,8 @@ class GlossaryTermIn(BaseModel):
     target_term: str = ""
     protected: bool = False
     notes: str = ""
+    kind: str | None = None  # character|place|term|other|"" — None: giữ nguyên (PUT)
+    status: str | None = None  # candidate|approved — None: approved (POST) / giữ nguyên (PUT)
 
 
 class GlossaryTermOut(BaseModel):
@@ -265,6 +273,135 @@ class GlossaryTermOut(BaseModel):
     target_term: str
     protected: bool
     notes: str = ""
+    kind: str = ""
+    status: str = "approved"
+
+
+# --- Bảng duyệt tên ---------------------------------------------------------
+
+
+class NameOutputHitOut(BaseModel):
+    variant_id: int
+    mode: str
+    segments: int
+
+
+class NameItemOut(BaseModel):
+    id: int
+    source_term: str
+    target_term: str
+    kind: str = ""
+    status: str = "approved"
+    notes: str = ""
+    protected: bool = False
+    source_chapter_count: int = 0
+    output_hits: list[NameOutputHitOut] = Field(default_factory=list)
+
+
+class NamesExtractIn(BaseModel):
+    provider_id: int | None = None
+    sample_chapters: int = 12  # tối đa 40 (kẹp phía server)
+
+
+class NamesExtractOut(BaseModel):
+    added: int
+    terms: list[NameItemOut]
+
+
+class NamesApproveIn(BaseModel):
+    term_ids: list[int]
+
+
+class NameApplyChangeIn(BaseModel):
+    term_id: int
+    new_target: str
+
+
+class NamesApplyIn(BaseModel):
+    changes: list[NameApplyChangeIn]
+    variant_ids: list[int] | None = None
+    dry_run: bool = False
+
+
+class NameApplyPerTermOut(BaseModel):
+    term_id: int
+    old_target: str
+    new_target: str
+    segments: int
+    replacements: int
+
+
+class NameApplySampleOut(BaseModel):
+    segment_id: int
+    variant_id: int
+    chapter_index: int
+    title: str = ""
+    before: str
+    after: str
+
+
+class NameApplyOut(BaseModel):
+    batch_id: int | None = None
+    total_replacements: int
+    per_term: list[NameApplyPerTermOut]
+    samples: list[NameApplySampleOut]
+
+
+class NameBatchChangeOut(BaseModel):
+    old: str
+    new: str
+
+
+class NameBatchOut(BaseModel):
+    id: int
+    created_at: dt.datetime
+    kind: str
+    variant_id: int | None = None
+    changes: list[NameBatchChangeOut]
+    segments: int
+
+
+class NameUndoOut(BaseModel):
+    restored: int
+    skipped: int
+
+
+# --- Bảng đổi vỏ (reskin) ------------------------------------------------------
+
+
+class SkinMapRowOut(BaseModel):
+    id: int
+    original: str
+    replacement: str
+    kind: str = ""
+    locked: bool = False
+
+
+class SkinMapGenerateIn(BaseModel):
+    provider_id: int | None = None
+    overwrite: bool = False
+
+
+class SkinMapRowIn(BaseModel):
+    original: str
+    replacement: str
+    kind: str | None = None
+
+
+class SkinMapRowPatchIn(BaseModel):
+    replacement: str | None = None
+    kind: str | None = None
+    locked: bool | None = None
+
+
+class SkinMapApplyChangeIn(BaseModel):
+    row_id: int
+    new_replacement: str
+
+
+class SkinMapApplyIn(BaseModel):
+    changes: list[SkinMapApplyChangeIn]
+    dry_run: bool = False
 
 
 class EstimateOut(BaseModel):
@@ -316,6 +453,20 @@ class AiProviderPatchIn(BaseModel):
     api_key: str | None = None  # None = giữ nguyên; "" = xoá
     api_keys: list[str] | None = None  # None = giữ nguyên; [] = xoá hết key phụ
     requires_api_key: bool | None = None
+
+
+class ChatMessageIn(BaseModel):
+    role: str
+    content: str
+
+
+class ChatIn(BaseModel):
+    provider_id: int
+    messages: list[ChatMessageIn]
+
+
+class ChatOut(BaseModel):
+    content: str
 
 
 class AiProviderOut(BaseModel):

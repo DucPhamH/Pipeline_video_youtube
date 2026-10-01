@@ -176,7 +176,7 @@ def test_rescan_without_new_chapters_does_not_rediscover(client):  # noqa: ARG00
             list_url="https://example.com/list-rescan",
         )
         novel_repo = SqlAlchemyNovelRepository(db)
-        novel_repo.add(
+        saved = novel_repo.add(
             Novel(
                 id=None,
                 title="Truyện cũ rescan",
@@ -187,6 +187,15 @@ def test_rescan_without_new_chapters_does_not_rediscover(client):  # noqa: ARG00
                 lifecycle_status=NovelLifecycle.FULLY_CRAWLED,
             )
         )
+        # "Có chương mới" so theo URL chương đã lưu — truyện cũ phải có đủ row.
+        from crawl.domain.entities import Chapter
+
+        chapter_repo = SqlAlchemyChapterRepository(db)
+        for i in range(1, 4):
+            ch = Chapter(id=None, novel_id=saved.id, chapter_index=i, title=f"第{i}章",
+                         source_url=f"https://example.com/novel-rescan/ch{i}")
+            ch.mark_crawled(f"/tmp/scan_existing_sync_raw/rescan-{i}.txt")
+            chapter_repo.add(ch)
         source = _SingleExistingSource(chapter_counts={"https://example.com/novel-rescan": 3})
         use_case = _build_use_case(db, source)
         result = use_case.execute(genre.id)

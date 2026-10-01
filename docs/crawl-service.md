@@ -1,5 +1,7 @@
 # Crawl Service — tài liệu thiết kế
 
+> Sản phẩm tên **Folio**. Tài liệu này chỉ là service cào (`crawl-service`), một trong ba service.
+
 > **AI / agent mới vào:** đọc **[crawl-overview.md](./crawl-overview.md) trước**
 > (1 trang nắm vấn đề + quyết định + đã ship). File này là bản **chi tiết /
 > lịch sử thiết kế** — đọc khi cần đào sâu.

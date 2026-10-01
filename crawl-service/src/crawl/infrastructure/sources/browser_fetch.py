@@ -103,6 +103,11 @@ def browser_get_html(
     source_key: str | None = None,
 ) -> str:
     """Mở URL trong Chromium, trả HTML sau khi (tuỳ chọn) chờ selector."""
+    from crawl.infrastructure.sources.fetch_guard import assert_public_url, cookie_allowed_for
+
+    assert_public_url(url)
+    if cookie_header and not cookie_allowed_for(url, source_key):
+        cookie_header = ""
     browser = _ensure_browser()
     if proxy is None:
         from crawl.infrastructure.sources.proxy_pool import get_a_proxy

@@ -144,6 +144,7 @@ class SegmentModel(Base):
     reviewed: Mapped[int] = mapped_column(Integer, default=0)  # 0/1 — SQLite-friendly bool
     slot_index: Mapped[int] = mapped_column(Integer, default=0)
     story_state: Mapped[str] = mapped_column(Text, default="")
+    qa_flags: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON list[str]
 
     job: Mapped["JobModel"] = relationship(back_populates="segments")
 
@@ -162,11 +163,59 @@ class GlossaryTermModel(Base):
     target_term: Mapped[str] = mapped_column(String(255), default="")
     protected: Mapped[int] = mapped_column(Integer, default=0)
     notes: Mapped[str] = mapped_column(String(500), default="")
+    # Bảng duyệt tên: character|place|term|other|"" ; candidate chưa đưa vào prompt.
+    kind: Mapped[str] = mapped_column(String(20), default="")
+    status: Mapped[str] = mapped_column(String(20), default="approved")
 
     __table_args__ = (
         UniqueConstraint("work_id", "source_term", name="uq_glossary_source"),
         Index("ix_glossary_work_id", "work_id"),
     )
+
+
+class VariantSkinMapModel(Base):
+    """Bảng "đổi vỏ" (mode reskin) — `original` là tên như trong bản FULL."""
+
+    __tablename__ = "variant_skin_map"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    variant_id: Mapped[int] = mapped_column(ForeignKey("variants.id"))
+    original: Mapped[str] = mapped_column(String(255))
+    replacement: Mapped[str] = mapped_column(String(255), default="")
+    kind: Mapped[str] = mapped_column(String(20), default="")
+    locked: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint("variant_id", "original", name="uq_skin_map_original"),
+        Index("ix_skin_map_variant_id", "variant_id"),
+    )
+
+
+class NameApplyBatchModel(Base):
+    """1 lần áp tên hàng loạt lên bản đã dịch — lưu để Undo."""
+
+    __tablename__ = "name_apply_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    work_id: Mapped[int] = mapped_column(ForeignKey("works.id"))
+    variant_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    changes_json: Mapped[str] = mapped_column(Text, default="[]")
+    kind: Mapped[str] = mapped_column(String(20), default="glossary")  # glossary|skin_map
+
+    __table_args__ = (Index("ix_name_apply_batch_work_id", "work_id"),)
+
+
+class NameApplyRowModel(Base):
+    __tablename__ = "name_apply_rows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("name_apply_batches.id"))
+    segment_id: Mapped[int] = mapped_column(Integer)
+    old_output: Mapped[str] = mapped_column(Text, default="")
+    new_output: Mapped[str] = mapped_column(Text, default="")
+
+    __table_args__ = (Index("ix_name_apply_row_batch_id", "batch_id"),)
 
 
 class TranslationCacheModel(Base):

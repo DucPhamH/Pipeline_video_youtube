@@ -93,6 +93,11 @@ class NovelOut(BaseModel):
     error_message: str | None
     author: str = ""
     cover_url: str = ""
+    # Additive — đếm theo trạng thái Chapter (1 query GROUP BY cho cả trang).
+    crawled_chapters: int = 0
+    failed_chapters: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class TranslateHandoffChapterOut(BaseModel):
@@ -105,6 +110,8 @@ class TranslateHandoffChapterOut(BaseModel):
     has_cleaned: bool
     reviewed: bool
     crawl_chapter_id: int
+    # Thứ tự đọc (vị trí TOC, fallback index) — `index` giữ làm định danh ổn định.
+    order: int | None = None
 
 
 class TranslateHandoffOut(BaseModel):
@@ -143,6 +150,8 @@ class SendToTranslateOut(BaseModel):
     missing_cleaned: int = 0
     unreviewed: int = 0
     translate_path: str = ""  # FE deep-link gợi ý
+    # Cảnh báo không chặn (novel đang lỗi / còn chương failed / thiếu chương).
+    warnings: list[str] = []
 
 
 class ChapterOut(BaseModel):
@@ -155,6 +164,7 @@ class ChapterOut(BaseModel):
     error_message: str | None
     reviewed: bool
     has_cleaned: bool = False
+    toc_order: int | None = None
 
 
 class ChapterListOut(BaseModel):
@@ -197,6 +207,8 @@ class SmoothNovelIn(BaseModel):
     """`chapter_ids=null/[]` = tất cả chương crawled; có list = chỉ những id đó."""
 
     chapter_ids: list[int] | None = None
+    # true = làm mượt cả chương đã review/sửa tay (ghi đè bản sửa).
+    force: bool = False
 
 
 class SmoothNovelOut(BaseModel):
@@ -204,6 +216,7 @@ class SmoothNovelOut(BaseModel):
     success: bool
     chapters_smoothed: int = 0
     chapters_skipped: int = 0
+    chapters_protected: int = 0
     removed_lines: int = 0
     chapter_ids: list[int] = []
     error: str | None = None
@@ -302,7 +315,11 @@ class SiteSessionOut(BaseModel):
     source_key: str
     configured: bool
     cookie_names: list[str]
+    # KHÔNG bao giờ trả giá trị cookie thật — luôn rỗng (giữ field cho FE cũ);
+    # xem has_cookie + cookie_hint.
     cookie_header: str = ""
+    has_cookie: bool = False
+    cookie_hint: str = ""
     required_cookies: list[str] = []
     missing_required_cookies: list[str] = []
 
@@ -322,3 +339,48 @@ class SiteSessionProbeOut(BaseModel):
     message: str
     cookie_configured: bool = False
     missing_required_cookies: list[str] = []
+
+
+class FollowIn(BaseModel):
+    auto_translate: bool = False
+    auto_audio: bool = False
+    voice_preset: str = "nam_ke"
+
+
+class FollowOut(BaseModel):
+    novel_id: int
+    title: str
+    lifecycle_status: str
+    total_chapters: int | None = None
+    auto_translate: bool
+    auto_audio: bool = False
+    voice_preset: str = "nam_ke"
+    tts_work_id: int | None = None
+    last_checked_at: datetime | None = None
+    last_new_chapters: int = 0
+    last_error: str | None = None
+    checking: bool = False
+
+
+class FollowListOut(BaseModel):
+    items: list[FollowOut]
+
+
+class PipelineIn(BaseModel):
+    voice_preset: str = "nam_ke"
+    engine: str = "edge"
+
+
+class PipelineOut(BaseModel):
+    novel_id: int
+    title: str
+    stage: str
+    voice_preset: str
+    engine: str
+    translate_work_id: int | None = None
+    tts_work_id: int | None = None
+    error: str | None = None
+
+
+class PipelineListOut(BaseModel):
+    items: list[PipelineOut]

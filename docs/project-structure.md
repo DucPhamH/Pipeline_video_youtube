@@ -1,5 +1,7 @@
 # Cấu trúc dự án — hiện trạng code thật
 
+> Sản phẩm tên **Folio**. Thư mục repo vẫn là `Crawl/`. `crawl-service` chỉ là service cào.
+>
 > Tài liệu này mô tả **code đã viết**, khác với `crawl-service.md` (thiết kế
 > nghiệp vụ) — đây là bản đồ thư mục để biết sửa gì ở đâu.
 

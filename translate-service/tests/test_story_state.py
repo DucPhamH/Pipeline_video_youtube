@@ -39,7 +39,7 @@ def _start():
     return server, server.server_address[1]
 
 
-def _wait_job(client, job_id: int, timeout: float = 15) -> dict:
+def _wait_job(client, job_id: int, timeout: float = 45) -> dict:  # summarize cũng qua giãn cách
     deadline = time.time() + timeout
     job = None
     while time.time() < deadline:

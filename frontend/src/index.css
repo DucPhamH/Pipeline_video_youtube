@@ -2,13 +2,40 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+@import "@fontsource-variable/fraunces";
+/* Source Serif 4 chỉ còn dùng cho thân văn bản trong trình đọc (.font-reading). */
 @import "@fontsource-variable/source-serif-4";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-    --font-heading: "Source Serif 4 Variable", "Source Serif 4", ui-serif, Georgia, serif;
+    --font-heading: "Fraunces Variable", "Fraunces", ui-serif, Georgia, serif;
+    --font-display: "Fraunces Variable", "Fraunces", ui-serif, Georgia, serif;
+    --font-serif: "Source Serif 4 Variable", "Source Serif 4", ui-serif, Georgia, serif;
     --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --color-primary-hover: var(--primary-hover);
+    --color-live: var(--live);
+    --color-glow: var(--glow);
+    --color-stage-collect: var(--stage-collect);
+    --color-stage-collect-soft: var(--stage-collect-soft);
+    --color-stage-translate: var(--stage-translate);
+    --color-stage-translate-soft: var(--stage-translate-soft);
+    --color-stage-listen: var(--stage-listen);
+    --color-stage-listen-soft: var(--stage-listen-soft);
+    --color-stage-write: var(--stage-write);
+    --color-stage-write-soft: var(--stage-write-soft);
+    --color-success: var(--success);
+    --color-success-soft: var(--success-soft);
+    --color-warning: var(--warning);
+    --color-warning-soft: var(--warning-soft);
+    --color-warning-dot: var(--warning-dot);
+    --color-danger: var(--danger);
+    --color-danger-soft: var(--danger-soft);
+    --color-info: var(--info);
+    --color-info-soft: var(--info-soft);
+    --color-track: var(--track);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -17,6 +44,8 @@
     --color-sidebar-primary: var(--sidebar-primary);
     --color-sidebar-foreground: var(--sidebar-foreground);
     --color-sidebar: var(--sidebar);
+    --color-sidebar-muted: var(--sidebar-muted);
+    --color-sidebar-surface: var(--sidebar-surface);
     --color-chart-5: var(--chart-5);
     --color-chart-4: var(--chart-4);
     --color-chart-3: var(--chart-3);
@@ -49,93 +78,314 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* Lantern Library — ink sidebar, bright paper workspace, jade action, one colour per pipeline stage. */
 :root {
-    /* Reading room — stone sage paper, book-green ink (not cream+terracotta) */
-    --background: #eceee9;
-    --foreground: #1c1f1a;
-    --card: #fafbf8;
-    --card-foreground: #1c1f1a;
-    --popover: #fafbf8;
-    --popover-foreground: #1c1f1a;
-    --primary: #2c5f4e;
-    --primary-foreground: #f3faf6;
-    --secondary: #e3e7e1;
-    --secondary-foreground: #1c1f1a;
-    --muted: #e3e7e1;
-    --muted-foreground: #5e6560;
-    --accent: #dce8e1;
-    --accent-foreground: #1e4338;
-    --destructive: #b91c1c;
-    --border: #d5d9d1;
-    --input: #d5d9d1;
-    --ring: #2c5f4e;
-    --chart-1: #2c5f4e;
-    --chart-2: #3b82a0;
-    --chart-3: #b45309;
-    --chart-4: #3f7a5a;
-    --chart-5: #6b7280;
-    --radius: 0.625rem;
-    --sidebar: #f4f5f1;
-    --sidebar-foreground: #1c1f1a;
-    --sidebar-primary: #2c5f4e;
-    --sidebar-primary-foreground: #f3faf6;
-    --sidebar-accent: #dce8e1;
-    --sidebar-accent-foreground: #1e4338;
-    --sidebar-border: #d5d9d1;
-    --sidebar-ring: #2c5f4e;
+    --background: #f3f5f4;
+    --foreground: #101614;
+    --card: #ffffff;
+    --card-foreground: #101614;
+    --popover: #ffffff;
+    --popover-foreground: #101614;
+    --primary: #0b8f6b;
+    --primary-hover: #08785a;
+    --primary-foreground: #ffffff;
+    --secondary: #eef2f0;
+    --secondary-foreground: #101614;
+    --muted: #eef2f0;
+    --muted-foreground: #5b6763;
+    --accent: #e3f5ee;
+    --accent-foreground: #076a50;
+    --destructive: #d92d3f;
+    --border: #e3e8e6;
+    --input: #dce3e0;
+    --ring: #0b8f6b;
+    --track: #e8edeb;
+    --chart-1: #0b8f6b;
+    --chart-2: #3563e9;
+    --chart-3: #d9820a;
+    --chart-4: #d63f5c;
+    --chart-5: #5b6763;
+    --radius: 0.75rem;
+
+    --live: #f5a524;
+    --glow: #2bd4a0;
+    --stage-collect: #3563e9;
+    --stage-collect-soft: #e8eefd;
+    --stage-translate: #0b8f6b;
+    --stage-translate-soft: #e3f5ee;
+    --stage-listen: #d9820a;
+    --stage-listen-soft: #fdf1de;
+    --stage-write: #d63f5c;
+    --stage-write-soft: #fce8ec;
+
+    --success: #076a50;
+    --success-soft: #e3f5ee;
+    --warning: #8a5300;
+    --warning-soft: #fdf1de;
+    --warning-dot: #b76e00;
+    --danger: #b42335;
+    --danger-soft: #fce8ec;
+    --info: #3b4a85;
+    --info-soft: #e8eefd;
+
+    /* Sidebar luôn là "mực" tối ở cả hai theme. */
+    --sidebar: #0e1513;
+    --sidebar-foreground: #b7c4bf;
+    --sidebar-muted: #7e8d88;
+    --sidebar-surface: #131d1a;
+    --sidebar-primary: #2bd4a0;
+    --sidebar-primary-foreground: #06261c;
+    --sidebar-accent: #1c2a26;
+    --sidebar-accent-foreground: #ffffff;
+    --sidebar-border: #24332f;
+    --sidebar-ring: #2bd4a0;
+
+    --shadow-cover: 0 1px 0 rgb(0 0 0 / 0.08), 0 10px 24px -10px rgb(16 22 20 / 0.45);
+    --shadow-cover-hover: 0 1px 0 rgb(0 0 0 / 0.08), 0 18px 32px -12px rgb(16 22 20 / 0.5);
+    --ease-out-expo: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 .dark {
-    --background: #121510;
-    --foreground: #e8ebe4;
-    --card: #1a1e18;
-    --card-foreground: #e8ebe4;
-    --popover: #1a1e18;
-    --popover-foreground: #e8ebe4;
-    --primary: #8fbc9f;
-    --primary-foreground: #122018;
-    --secondary: #252a23;
-    --secondary-foreground: #e8ebe4;
-    --muted: #252a23;
-    --muted-foreground: #9aa398;
-    --accent: #243029;
-    --accent-foreground: #c5e0cf;
-    --destructive: #f07171;
-    --border: #2c332b;
-    --input: #2c332b;
-    --ring: #8fbc9f;
-    --chart-1: #8fbc9f;
-    --chart-2: #7eb6c9;
-    --chart-3: #e0a45c;
-    --chart-4: #6fbf8e;
-    --chart-5: #a8b0a4;
-    --sidebar: #1a1e18;
-    --sidebar-foreground: #e8ebe4;
-    --sidebar-primary: #8fbc9f;
-    --sidebar-primary-foreground: #122018;
-    --sidebar-accent: #243029;
-    --sidebar-accent-foreground: #c5e0cf;
-    --sidebar-border: #2c332b;
-    --sidebar-ring: #8fbc9f;
+    --background: #0b110f;
+    --foreground: #e8eeeb;
+    --card: #131b18;
+    --card-foreground: #e8eeeb;
+    --popover: #131b18;
+    --popover-foreground: #e8eeeb;
+    --primary: #2bd4a0;
+    --primary-hover: #4fe0b3;
+    --primary-foreground: #06261c;
+    --secondary: #1a2420;
+    --secondary-foreground: #e8eeeb;
+    --muted: #1a2420;
+    --muted-foreground: #93a39d;
+    --accent: color-mix(in srgb, #2bd4a0 15%, #131b18);
+    --accent-foreground: #7ff0c9;
+    --destructive: #ff6b7d;
+    --border: #24332f;
+    --input: #2c3d38;
+    --ring: #2bd4a0;
+    --track: #24332f;
+    --chart-1: #2bd4a0;
+    --chart-2: #7fa2ff;
+    --chart-3: #f5a524;
+    --chart-4: #ff7a93;
+    --chart-5: #93a39d;
+
+    --live: #f5a524;
+    --glow: #2bd4a0;
+    --stage-collect: #7fa2ff;
+    --stage-collect-soft: color-mix(in srgb, #7fa2ff 15%, transparent);
+    --stage-translate: #2bd4a0;
+    --stage-translate-soft: color-mix(in srgb, #2bd4a0 15%, transparent);
+    --stage-listen: #f5a524;
+    --stage-listen-soft: color-mix(in srgb, #f5a524 15%, transparent);
+    --stage-write: #ff7a93;
+    --stage-write-soft: color-mix(in srgb, #ff7a93 15%, transparent);
+
+    --success: #5ee6b8;
+    --success-soft: color-mix(in srgb, #2bd4a0 15%, transparent);
+    --warning: #f7b955;
+    --warning-soft: color-mix(in srgb, #f5a524 15%, transparent);
+    --warning-dot: #f5a524;
+    --danger: #ff8fa3;
+    --danger-soft: color-mix(in srgb, #ff7a93 15%, transparent);
+    --info: #a3bcff;
+    --info-soft: color-mix(in srgb, #7fa2ff 15%, transparent);
+
+    --sidebar: #080d0b;
+    --sidebar-foreground: #b7c4bf;
+    --sidebar-muted: #7e8d88;
+    --sidebar-surface: #101815;
+    --sidebar-primary: #2bd4a0;
+    --sidebar-primary-foreground: #06261c;
+    --sidebar-accent: #17221f;
+    --sidebar-accent-foreground: #ffffff;
+    --sidebar-border: #1d2925;
+    --sidebar-ring: #2bd4a0;
+
+    --shadow-cover: 0 1px 0 rgb(0 0 0 / 0.3), 0 10px 24px -10px rgb(0 0 0 / 0.7);
+    --shadow-cover-hover: 0 1px 0 rgb(0 0 0 / 0.3), 0 18px 32px -12px rgb(0 0 0 / 0.75);
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
   }
-  body {
-    @apply bg-background text-foreground antialiased;
-    background-image:
-      radial-gradient(ellipse 120% 80% at 0% 0%, color-mix(in srgb, var(--primary) 6%, transparent), transparent 55%),
-      radial-gradient(ellipse 90% 60% at 100% 0%, color-mix(in srgb, var(--foreground) 3%, transparent), transparent 50%);
-    background-attachment: fixed;
-  }
   html {
     @apply font-sans;
+    font-size: 15px;
   }
-  .font-heading {
+  body {
+    @apply bg-background text-foreground antialiased;
+    line-height: 1.55;
+    font-feature-settings: "cv11", "ss01";
+  }
+  /* Native <select> trông giống SelectTrigger: bỏ mũi tên hệ điều hành, dùng chevron chung. */
+  select:not([multiple]) {
+    appearance: none;
+    padding-right: 2rem;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235B6763' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.5rem center;
+    background-size: 1rem;
+    text-overflow: ellipsis;
+  }
+  select:focus-visible {
+    border-color: var(--ring);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--ring) 40%, transparent);
+    outline: none;
+  }
+  select:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+  .font-heading,
+  .font-display {
     font-family: var(--font-heading);
     font-weight: 600;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
+    font-optical-sizing: auto;
+  }
+  .font-reading {
+    font-family: var(--font-serif);
+  }
+  .font-mono,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* ───────────── Motion ───────────── */
+@keyframes folio-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes folio-shimmer {
+  from {
+    background-position: -200px 0;
+  }
+  to {
+    background-position: calc(100% + 200px) 0;
+  }
+}
+@keyframes folio-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+}
+
+@layer utilities {
+  /* Vào trang: mờ dần + nhô lên 8px. AppLayout gắn class này vào wrapper key theo pathname. */
+  .page-enter {
+    animation: folio-rise 220ms var(--ease-out-expo) both;
+  }
+  .rise {
+    animation: folio-rise 320ms var(--ease-out-expo) both;
+  }
+  /* Danh sách: con thứ n trễ 30ms·n, tối đa 10 con đầu. */
+  .stagger > * {
+    animation: folio-rise 320ms var(--ease-out-expo) both;
+    animation-delay: 300ms;
+  }
+  .stagger > *:nth-child(1) { animation-delay: 0ms; }
+  .stagger > *:nth-child(2) { animation-delay: 30ms; }
+  .stagger > *:nth-child(3) { animation-delay: 60ms; }
+  .stagger > *:nth-child(4) { animation-delay: 90ms; }
+  .stagger > *:nth-child(5) { animation-delay: 120ms; }
+  .stagger > *:nth-child(6) { animation-delay: 150ms; }
+  .stagger > *:nth-child(7) { animation-delay: 180ms; }
+  .stagger > *:nth-child(8) { animation-delay: 210ms; }
+  .stagger > *:nth-child(9) { animation-delay: 240ms; }
+  .stagger > *:nth-child(10) { animation-delay: 270ms; }
+
+  /* Thanh tiến độ đang chạy: vệt sáng quét qua. */
+  .progress-live {
+    background-image: linear-gradient(
+      90deg,
+      rgb(255 255 255 / 0) 0,
+      rgb(255 255 255 / 0.55) 50%,
+      rgb(255 255 255 / 0) 100%
+    );
+    background-size: 200px 100%;
+    background-repeat: no-repeat;
+    animation: folio-shimmer 1.6s linear infinite;
+  }
+  /* Chấm "đang chạy" nhịp thở. */
+  .dot-live {
+    animation: folio-pulse 1.4s ease-in-out infinite;
+  }
+  /* Thẻ / bìa: nhấc 4px khi hover, bóng đậm hơn. */
+  .lift {
+    transition:
+      transform 200ms var(--ease-out-expo),
+      box-shadow 200ms var(--ease-out-expo);
+  }
+  .lift:hover,
+  .group:hover > .lift,
+  .group:focus-visible > .lift {
+    transform: translateY(-4px);
+    box-shadow: var(--shadow-cover-hover);
+  }
+  /* Skeleton có vệt sáng. */
+  .skeleton-shimmer {
+    background-color: var(--muted);
+    background-image: linear-gradient(
+      90deg,
+      transparent 0,
+      color-mix(in srgb, var(--card) 45%, transparent) 50%,
+      transparent 100%
+    );
+    background-size: 200px 100%;
+    background-repeat: no-repeat;
+    animation: folio-shimmer 1.4s linear infinite;
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+}
+
+/* Toast (sonner) khớp thẻ: bo 12px, viền, bóng mềm, chữ 14px. */
+.cn-toast {
+  border-radius: 12px !important;
+  font-size: 14px !important;
+  font-family: var(--font-sans) !important;
+  box-shadow: 0 12px 32px -12px rgb(16 22 20 / 0.28) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .page-enter,
+  .rise,
+  .stagger > *,
+  .progress-live,
+  .dot-live,
+  .skeleton-shimmer {
+    animation: none !important;
+  }
+  .lift,
+  .lift:hover,
+  .group:hover > .lift {
+    transition: none !important;
+    transform: none !important;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

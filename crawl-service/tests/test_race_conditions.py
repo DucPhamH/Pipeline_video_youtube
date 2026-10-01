@@ -114,7 +114,10 @@ def test_add_novel_use_case_gracefully_handles_duplicate_race(client):
     # session-scope: chạy cả bộ test, demo_novel có thể đã bị test khác
     # đăng ký từ trước, khiến nhánh "existing" thường bắt được trước khi
     # tới nhánh race muốn test ở đây.
-    novel_dir = Path(tempfile.mkdtemp(prefix="race_test_novel_"))
+    # Nằm TRONG fixtures_dir — demo_local từ chối đọc đường dẫn ngoài thư mục đó.
+    from platform_.config import config as _cfg
+
+    novel_dir = Path(tempfile.mkdtemp(prefix="race_test_novel_", dir=_cfg.fixtures_dir))
     (novel_dir / "chapter_001.txt").write_text(
         "这是专门为本测试新建的临时章节内容,与其他测试完全隔离,汉字比例足够高。" * 2,
         encoding="utf-8",
@@ -148,3 +151,6 @@ def test_add_novel_use_case_gracefully_handles_duplicate_race(client):
     finally:
         db.close()
         other_db.close()
+        import shutil
+
+        shutil.rmtree(novel_dir, ignore_errors=True)

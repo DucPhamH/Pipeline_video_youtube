@@ -147,8 +147,11 @@ SOURCES: dict[str, SourcePort] = {
     _munpia_com.key: _munpia_com,
     _blqiuge_cc.key: _blqiuge_cc,
     _pixiv_net.key: _pixiv_net,
-    _demo_local.key: _demo_local,
 }
+# Nguồn demo đọc file trên đĩa — chỉ đăng ký khi bật CRAWL_ENABLE_DEMO_SOURCE
+# (test/dev). Tắt thì dry-run / thêm truyện với source_key=demo_local 404.
+if config.crawl_enable_demo_source:
+    SOURCES[_demo_local.key] = _demo_local
 
 # biquge.pro đã gỡ (HTTP 520 dai dẳng trên /novel/*) — genre cũ trong DB
 # bị tắt tự động qua catalog_genre_keys() lúc startup.
@@ -161,14 +164,17 @@ GENRE_SEEDS = [
         "enabled": True,
         "list_url": "https://www.bqgxs.com/search.php?q=%E6%81%90%E6%80%96",
     },
-    {
-        "source_key": "demo_local",
-        "genre_key": "demo",
-        "label": "[Demo] Nguồn test cục bộ",
-        "list_url": "demo",
-        "enabled": True,
-    },
 ]
+if config.crawl_enable_demo_source:
+    GENRE_SEEDS.append(
+        {
+            "source_key": "demo_local",
+            "genre_key": "demo",
+            "label": "[Demo] Nguồn test cục bộ",
+            "list_url": "demo",
+            "enabled": True,
+        }
+    )
 
 # bqgxs.com nav thật: 玄幻/武侠/都市/历史/网游/科幻/言情/其他 — /list{1..8}/
 _BQGXS_CATEGORIES = [
@@ -1034,7 +1040,7 @@ for _key, _label, _id, _enabled in _SHUBAOW_CATEGORIES:
 _TADU_CATEGORIES = [
     ("fantasy", "Huyền huyễn (东方玄幻)", "99", "909", True),
     ("urban", "Đô thị (现代都市)", "103", "909", False),
-    ("other", "Sáng tạo (脑洞创意)", "135", "909", False),
+    ("other", "Khác (脑洞创意)", "135", "909", False),
     ("historical", "Lịch sử (历史架空)", "108", "909", False),
     ("military", "Quân sự (军事战争)", "113", "909", False),
     ("game", "Du hí/Game (游戏竞技)", "112", "909", False),
@@ -1043,7 +1049,7 @@ _TADU_CATEGORIES = [
     ("horror", "Kinh dị (灵异悬疑)", "128", "909", False),
     ("western", "Kỳ ảo Tây (西方奇幻)", "107", "909", False),
     ("short", "Truyện ngắn (短篇小说)", "281", "909", False),
-    ("female", "Nữ văn (女频全部)", "122", "122", False),
+    ("female", "Ngôn tình nữ (女频全部)", "122", "122", False),
 ]
 for _key, _label, _gid, _scope, _enabled in _TADU_CATEGORIES:
     GENRE_SEEDS.append(
@@ -1070,7 +1076,7 @@ _ALPHAPOLIS_CATEGORIES = [
     ("fanfic", "Đồng nhân (BL)", "119000", False),
     ("light_novel", "Light novel (ライト文芸)", "111500", False),
     ("youth", "Thanh xuân (青春)", "110600", False),
-    ("other", "Giải trí (大衆娯楽)", "110800", False),
+    ("other", "Khác (大衆娯楽)", "110800", False),
 ]
 for _key, _label, _cid, _enabled in _ALPHAPOLIS_CATEGORIES:
     GENRE_SEEDS.append(
@@ -1120,7 +1126,7 @@ _BLQIUGE_CATEGORIES = [
     ("fantasy", "Huyền huyễn (玄幻)", "xuanhuanxiaoshuo", True),
     ("wuxia", "Võ hiệp/Tu chân (修真)", "xiuzhenxiaoshuo", False),
     ("urban", "Đô thị (都市)", "dushixiaoshuo", False),
-    ("historical", "Xuyên không (穿越)", "chuanyuexiaoshuo", False),
+    ("historical", "Lịch sử (穿越)", "chuanyuexiaoshuo", False),
     ("game", "Du hí/Game (网游)", "wangyouxiaoshuo", False),
     ("scifi", "Khoa huyễn (科幻)", "kehuanxiaoshuo", False),
     ("other", "Khác (其他)", "qitaxiaoshuo", False),

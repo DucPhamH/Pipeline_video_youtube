@@ -68,7 +68,11 @@ def test_single_scrape_error_skips_and_continues(client):  # noqa: ARG001
         assert result.chapters_crawled == 4
 
         chapters = SqlAlchemyChapterRepository(db).list_by_novel(novel.id)
-        assert [c.chapter_index for c in chapters] == [1, 2, 4, 5]
+        assert [c.chapter_index for c in chapters if c.status.value == "crawled"] == [1, 2, 4, 5]
+        # Chương lỗi được lưu thành row failed (FE lọc + retry từng chương).
+        failed = [c for c in chapters if c.status.value == "failed"]
+        assert [c.chapter_index for c in failed] == [3]
+        assert "lỗi giả lập" in (failed[0].error_message or "")
         assert novel_repo.get_by_id(novel.id).lifecycle_status.value == "fully_crawled"
     finally:
         db.close()
@@ -119,7 +123,9 @@ def test_retry_resumes_from_failed_chapter_not_from_scratch(client):  # noqa: AR
 
         chapter_repo = SqlAlchemyChapterRepository(db)
         chapters_after_fail = chapter_repo.list_by_novel(novel.id)
-        assert [c.chapter_index for c in chapters_after_fail] == [1, 2]
+        assert [c.chapter_index for c in chapters_after_fail if c.status.value == "crawled"] == [1, 2]
+        # ch 3-5 lỗi được lưu row failed; Retry bên dưới lật chúng thành crawled.
+        assert [c.chapter_index for c in chapters_after_fail if c.status.value == "failed"] == [3, 4, 5]
 
         novel_after_fail = novel_repo.get_by_id(novel.id)
         assert novel_after_fail.lifecycle_status.value == "error"

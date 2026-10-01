@@ -1,28 +1,49 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link, useNavigate, useParams } from "react-router-dom"
-import { useMemo, useState } from "react"
+import { useMemo, useState, type ReactNode } from "react"
 import { toast } from "sonner"
-import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
+import {
+  AlertTriangle,
+  ArrowRight,
+  BookX,
+  Download,
+  ListChecks,
+  MoreHorizontal,
+  RotateCcw,
+  Search,
+  Send,
+  Sparkles,
+  Wand2,
+} from "lucide-react"
+import { Button, buttonVariants } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
+import { Progress } from "@/components/ui/progress"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { useDebouncedValue } from "@/hooks/useDebouncedValue"
 import { useT } from "@/i18n"
+import { cn } from "@/lib/utils"
 import { ActionMenu, ActionMenuItem } from "@/components/ActionMenu"
+import { BookCover } from "@/components/BookCover"
 import { ConfirmDialog } from "@/components/ConfirmDialog"
-import { PageHeader, PageShell, StatChip } from "@/components/PageChrome"
+import { EmptyState } from "@/components/EmptyState"
+import { Breadcrumbs, PageHeader, PageShell, SegmentedTabs } from "@/components/PageChrome"
+import { StatusPill } from "@/components/StatusPill"
+import { useConfirm } from "@/components/useConfirm"
 import { queryKeys } from "@/lib/query-client"
 import { ApiError } from "../../../api/client"
 import type { Chapter } from "../../../api/types"
 import { crawlApi } from "../api"
+import { translateApi } from "@/features/translate/api"
 import { ChapterReviewDialog } from "../components/ChapterReviewDialog"
-import { StatusBadge } from "../components/StatusBadge"
+import { ChapterStatusPill, StatusBadge } from "../components/StatusBadge"
+import { FollowCard } from "../components/FollowCard"
+import { PipelineCard } from "../components/PipelineCard"
+import { PageSkeleton } from "@/components/Skeleton"
 
 const POLL_MS = 3000
+const PROGRESS_POLL_MS = 1500
 const PAGE_SIZE = 20
 
 const STATUS_VALUES = ["all", "pending", "crawled", "failed"] as const
@@ -39,12 +60,12 @@ function detectChapterPreset(
   status: (typeof STATUS_VALUES)[number],
   review: (typeof REVIEW_VALUES)[number],
   cleaned: (typeof CLEANED_VALUES)[number],
-): ChapterPreset | null {
+): ChapterPreset | "custom" {
   if (status === "all" && review === "all" && cleaned === "all") return "all"
   if (status === "crawled" && review === "all" && cleaned === "raw") return "need_smooth"
   if (status === "crawled" && review === "unreviewed" && cleaned === "cleaned") return "need_review"
   if (status === "failed" && review === "all" && cleaned === "all") return "failed"
-  return null
+  return "custom"
 }
 
 export function NovelDetailPage() {
@@ -53,6 +74,7 @@ export function NovelDetailPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const t = useT()
+  const [confirm, confirmDialog] = useConfirm()
   const [reviewingChapter, setReviewingChapter] = useState<{ id: number; title: string } | null>(null)
   const [statusFilter, setStatusFilter] = useState<(typeof STATUS_VALUES)[number]>("all")
   const [reviewFilter, setReviewFilter] = useState<(typeof REVIEW_VALUES)[number]>("all")
@@ -60,7 +82,7 @@ export function NovelDetailPage() {
   const [search, setSearch] = useState("")
   const [offset, setOffset] = useState(0)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(() => new Set())
-  const [lastSmoothSummary, setLastSmoothSummary] = useState<string | null>(null)
+  const [lastSmooth, setLastSmooth] = useState<{ summary: string; protectedCount: number; chapterIds?: number[] } | null>(null)
   const [confirmDeleteNovel, setConfirmDeleteNovel] = useState(false)
   const [confirmDeleteChapterId, setConfirmDeleteChapterId] = useState<number | null>(null)
   const debouncedSearch = useDebouncedValue(search.trim(), 350)
@@ -75,7 +97,6 @@ export function NovelDetailPage() {
       ] as const,
     [t],
   )
-
   const reviewOptions = useMemo(
     () =>
       [
@@ -85,7 +106,6 @@ export function NovelDetailPage() {
       ] as const,
     [t],
   )
-
   const cleanedOptions = useMemo(
     () =>
       [
@@ -97,20 +117,12 @@ export function NovelDetailPage() {
   )
 
   const effectiveStatus = statusFilter === "all" ? undefined : statusFilter
-  const effectiveReviewed =
-    reviewFilter === "all" ? undefined : reviewFilter === "reviewed"
-  const effectiveCleaned =
-    cleanedFilter === "all" ? undefined : cleanedFilter === "cleaned"
+  const effectiveReviewed = reviewFilter === "all" ? undefined : reviewFilter === "reviewed"
+  const effectiveCleaned = cleanedFilter === "all" ? undefined : cleanedFilter === "cleaned"
 
-  // Đổi truyện/bộ lọc → reset trang + selection NGAY TRONG RENDER (không
-  // qua useEffect) — sửa 17/9/2026: bản cũ dùng effect để setOffset(0), nên
-  // đổi filter lúc offset > 0 khiến query chạy 1 lần với offset CŨ (còn
-  // hiệu lực ở chính render đó) rồi mới render lại với offset=0 → tốn 1
-  // request thật sự thừa mỗi lần đổi filter, oxlint gắn cờ
-  // `react(set-state-in-effect)` đúng chỗ này. Đồng thời fix thêm 1 bug tồn
-  // tại từ trước: đổi filter KHÔNG kèm effect reset `novelId` — chuyển giữa
-  // 2 trang chi tiết truyện trong khi đang ở trang 3+ sẽ giữ nguyên offset
-  // cũ (có thể vượt quá số chương của truyện MỚI), giờ gộp chung 1 khoá.
+  // Đổi truyện/bộ lọc → reset trang + selection NGAY TRONG RENDER (không qua
+  // useEffect) — tránh 1 request thừa với offset CŨ, và reset khi chuyển giữa
+  // 2 truyện (`react(set-state-in-effect)`).
   const resetKey = `${novelId}|${effectiveStatus}|${effectiveReviewed}|${cleanedFilter}|${debouncedSearch}`
   const [prevResetKey, setPrevResetKey] = useState(resetKey)
   if (resetKey !== prevResetKey) {
@@ -134,6 +146,16 @@ export function NovelDetailPage() {
     enabled: Number.isFinite(novelId),
     refetchInterval: (q) => (q.state.data?.lifecycle_status === "crawling" ? POLL_MS : false),
   })
+  const isCrawling = novel?.lifecycle_status === "crawling"
+
+  const { data: liveProgress } = useQuery({
+    queryKey: ["novel-progress", novelId],
+    queryFn: () => crawlApi.getNovelProgress(novelId),
+    enabled: Number.isFinite(novelId) && isCrawling,
+    refetchInterval: isCrawling ? PROGRESS_POLL_MS : false,
+    retry: false,
+  })
+  const progress = isCrawling ? (liveProgress?.progress ?? null) : null
 
   const {
     data: chaptersData,
@@ -145,7 +167,7 @@ export function NovelDetailPage() {
     queryFn: () => crawlApi.listChapters(novelId, chapterParams),
     enabled: Number.isFinite(novelId),
     placeholderData: (prev) => prev,
-    refetchInterval: () => (novel?.lifecycle_status === "crawling" ? POLL_MS : false),
+    refetchInterval: () => (isCrawling ? POLL_MS : false),
   })
 
   const { data: exportStatus, refetch: refetchExportStatus } = useQuery({
@@ -159,9 +181,25 @@ export function NovelDetailPage() {
     queryFn: () => crawlApi.listChapters(novelId, { status: "failed", limit: 1, offset: 0 }),
     enabled: Number.isFinite(novelId),
   })
-  const failedChapterTotal = failedCountData?.total ?? 0
+  const failedChapterTotal = novel?.failed_chapters ?? failedCountData?.total ?? 0
 
-  const chapters = chaptersData?.items ?? []
+  // Đã handoff sang translate → tìm Work có external_id "crawl:novel:{id}" để link sang.
+  const handedOff =
+    novel?.lifecycle_status === "translating" ||
+    novel?.lifecycle_status === "ready_for_video" ||
+    novel?.lifecycle_status === "produced"
+  const { data: translateWorkId } = useQuery({
+    queryKey: ["translate-work-for-novel", novelId],
+    queryFn: async () => {
+      const list = await translateApi.listWorks()
+      return list.items.find((w) => w.external_id === `crawl:novel:${novelId}`)?.id ?? null
+    },
+    enabled: Number.isFinite(novelId) && handedOff,
+    retry: false,
+    staleTime: 60_000,
+  })
+
+  const chapters = useMemo(() => chaptersData?.items ?? [], [chaptersData])
   const total = chaptersData?.total ?? 0
   const from = total === 0 ? 0 : offset + 1
   const to = Math.min(offset + PAGE_SIZE, total)
@@ -179,11 +217,8 @@ export function NovelDetailPage() {
     novel?.lifecycle_status === "translating" ||
     novel?.lifecycle_status === "ready_for_video"
 
-  const canSendToTranslate =
-    novel?.lifecycle_status === "fully_crawled" ||
-    novel?.lifecycle_status === "error" ||
-    novel?.lifecycle_status === "ready_for_video" ||
-    novel?.lifecycle_status === "translating"
+  const canSendToTranslate = canSmoothNovel
+  const canRetryNovel = novel?.lifecycle_status === "error" || novel?.lifecycle_status === "fully_crawled"
 
   const activePreset = detectChapterPreset(statusFilter, reviewFilter, cleanedFilter)
 
@@ -270,19 +305,8 @@ export function NovelDetailPage() {
     }
   }
 
-  const hasReviewNext = useMemo(() => {
-    if (!reviewingChapter) return false
-    const items = chaptersData?.items ?? []
-    const idx = items.findIndex((c) => c.id === reviewingChapter.id)
-    if (
-      idx >= 0 &&
-      items.slice(idx + 1).some((c) => c.status === "crawled" && !c.reviewed && c.has_cleaned)
-    ) {
-      return true
-    }
-    // Optimistic: allow next; goNextReview will close if none left.
-    return true
-  }, [reviewingChapter, chaptersData?.items])
+  // Optimistic: luôn cho "Lưu & tiếp" — goNextReview tự đóng khi hết chương.
+  const hasReviewNext = reviewingChapter != null
 
   async function selectAllCrawledChapters() {
     setSelectingAll(true)
@@ -291,19 +315,13 @@ export function NovelDetailPage() {
       let off = 0
       const limit = 100
       for (;;) {
-        const page = await crawlApi.listChapters(novelId, {
-          status: "crawled",
-          limit,
-          offset: off,
-        })
+        const page = await crawlApi.listChapters(novelId, { status: "crawled", limit, offset: off })
         for (const ch of page.items) ids.push(ch.id)
         if (off + limit >= page.total || page.items.length === 0) break
         off += limit
       }
       setSelectedIds(new Set(ids))
-      toast.message(
-        ids.length ? t("novel.selectedCrawled", { count: ids.length }) : t("novel.noCrawled"),
-      )
+      toast.message(ids.length ? t("novel.selectedCrawled", { count: ids.length }) : t("novel.noCrawled"))
     } catch (err) {
       toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
     } finally {
@@ -311,22 +329,27 @@ export function NovelDetailPage() {
     }
   }
 
+  const onError = (err: unknown) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError"))
+
   const smoothMutation = useMutation({
-    mutationFn: (chapterIds?: number[]) => crawlApi.smoothNovel(novelId, chapterIds),
-    onSuccess: (result, chapterIds) => {
-      const scope = chapterIds?.length
+    mutationFn: (vars: { chapterIds?: number[]; force?: boolean }) =>
+      crawlApi.smoothNovel(novelId, vars.chapterIds, vars.force ?? false),
+    onSuccess: (result, vars) => {
+      const scope = vars.chapterIds?.length
         ? t("novel.smoothScopeSelected", { count: result.chapters_smoothed })
         : t("novel.smoothScopeAll")
       const summary =
         t("novel.smoothSummary", { count: result.chapters_smoothed, scope }) +
         (result.removed_lines ? t("novel.smoothRemoved", { count: result.removed_lines }) : "")
-      setLastSmoothSummary(summary)
+      const protectedCount = result.chapters_protected ?? 0
+      setLastSmooth({ summary, protectedCount, chapterIds: vars.chapterIds })
       setSelectedIds(new Set())
       setStatusFilter("crawled")
       setReviewFilter("unreviewed")
       setCleanedFilter("cleaned")
       toast.success(summary, {
-        description: t("novel.reviewHint"),
+        description:
+          protectedCount > 0 ? t("novel.smoothProtected", { count: protectedCount }) : t("novel.reviewHint"),
         action:
           result.chapter_ids.length > 0
             ? {
@@ -346,8 +369,17 @@ export function NovelDetailPage() {
       void refetch()
       void refetchExportStatus()
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
+
+  async function smoothForce(chapterIds?: number[]) {
+    const ok = await confirm({
+      title: t("novel.smoothForceTitle"),
+      description: t("novel.smoothForceConfirm"),
+      confirmLabel: t("novel.smoothForce"),
+    })
+    if (ok) smoothMutation.mutate({ chapterIds, force: true })
+  }
 
   const sendToTranslateMutation = useMutation({
     mutationFn: (requireCleaned: boolean) =>
@@ -355,9 +387,7 @@ export function NovelDetailPage() {
     onSuccess: (result) => {
       toast.success(t("novel.sendToTranslateOk"), {
         description:
-          result.unreviewed > 0
-            ? t("novel.sendToTranslateUnreviewed", { count: result.unreviewed })
-            : undefined,
+          result.unreviewed > 0 ? t("novel.sendToTranslateUnreviewed", { count: result.unreviewed }) : undefined,
         action: {
           label: t("novel.openTranslate"),
           onClick: () => navigate(result.translate_path || `/translate/${result.work_id}`),
@@ -367,16 +397,14 @@ export function NovelDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ["novels"] })
       navigate(result.translate_path || `/translate/${result.work_id}`)
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
 
   const retryChapterMutation = useMutation({
     mutationFn: (chapterId: number) => crawlApi.retryChapter(chapterId),
     onSuccess: (result) => {
       if (result.success) {
-        toast.success(
-          result.novel_completed ? t("novel.retryOkNovel") : t("novel.retryOkChapter"),
-        )
+        toast.success(result.novel_completed ? t("novel.retryOkNovel") : t("novel.retryOkChapter"))
       } else {
         toast.error(result.error ?? t("novel.retryFail"))
       }
@@ -387,20 +415,37 @@ export function NovelDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ["export-status", novelId] })
       void queryClient.invalidateQueries({ queryKey: ["chapters-failed-count", novelId] })
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
+
+  const invalidateNovel = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.novel(novelId) })
+    void queryClient.invalidateQueries({ queryKey: ["chapters", novelId] })
+    void queryClient.invalidateQueries({ queryKey: ["chapters-failed-count", novelId] })
+    void queryClient.invalidateQueries({ queryKey: ["export-status", novelId] })
+    void queryClient.invalidateQueries({ queryKey: ["novels"] })
+  }
 
   const retryNovelMutation = useMutation({
     mutationFn: () => crawlApi.retryNovel(novelId),
     onSuccess: () => {
       toast.message(t("novel.retryNovelQueued"))
-      void queryClient.invalidateQueries({ queryKey: queryKeys.novel(novelId) })
-      void queryClient.invalidateQueries({ queryKey: ["chapters", novelId] })
-      void queryClient.invalidateQueries({ queryKey: ["chapters-failed-count", novelId] })
-      void queryClient.invalidateQueries({ queryKey: ["export-status", novelId] })
-      void queryClient.invalidateQueries({ queryKey: ["novels"] })
+      invalidateNovel()
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
+  })
+
+  const forceAcceptMutation = useMutation({
+    mutationFn: () => crawlApi.forceAcceptNovel(novelId),
+    onSuccess: (result) => {
+      if (!result.success) {
+        toast.error(result.error ?? t("lifecycle.error"))
+        return
+      }
+      toast.message(t("site.toastForce"))
+      invalidateNovel()
+    },
+    onError,
   })
 
   const deleteNovelMutation = useMutation({
@@ -412,7 +457,7 @@ export function NovelDetailPage() {
       if (novel?.source_key) navigate(`/sites/${novel.source_key}`)
       else navigate("/sites")
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
 
   const deleteChapterMutation = useMutation({
@@ -424,31 +469,28 @@ export function NovelDetailPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.novel(novelId) })
       void queryClient.invalidateQueries({ queryKey: ["export-status", novelId] })
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
 
   const exportWorkbookMutation = useMutation({
     mutationFn: () => crawlApi.exportNovelWorkbook(novelId),
     onSuccess: () => toast.success(t("novel.exportOk")),
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
-
   const exportTxtMutation = useMutation({
     mutationFn: () => crawlApi.exportNovelTxt(novelId),
     onSuccess: () => toast.success(t("novel.exportTxtOk")),
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
-
   const exportEpubMutation = useMutation({
     mutationFn: () => crawlApi.exportNovelEpub(novelId),
     onSuccess: () => toast.success(t("novel.exportEpubOk")),
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
-
   const exportBundleMutation = useMutation({
     mutationFn: () => crawlApi.exportNovelBundle(novelId),
     onSuccess: () => toast.success(t("novel.exportBundleOk")),
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
 
   const exportBusy =
@@ -468,14 +510,14 @@ export function NovelDetailPage() {
       void queryClient.invalidateQueries({ queryKey: ["chapters", novelId] })
       void queryClient.invalidateQueries({ queryKey: ["export-status", novelId] })
     },
-    onError: (err) => toast.error(err instanceof ApiError ? err.message : t("app.unknownError")),
+    onError,
   })
 
-  function toggleOne(id: number, checked: boolean) {
+  function toggleOne(cid: number, checked: boolean) {
     setSelectedIds((prev) => {
       const next = new Set(prev)
-      if (checked) next.add(id)
-      else next.delete(id)
+      if (checked) next.add(cid)
+      else next.delete(cid)
       return next
     })
   }
@@ -494,12 +536,11 @@ export function NovelDetailPage() {
   if (!Number.isFinite(novelId)) {
     return (
       <PageShell>
-        <PageHeader title={t("app.unknownError")} description={t("novel.invalidId")} />
-        <p className="text-sm text-muted-foreground">
-          <Link to="/sites" className="text-primary hover:underline">
-            {t("common.backSites")}
-          </Link>
-        </p>
+        <PageHeader
+          breadcrumbs={[{ label: t("sites.title"), to: "/sites" }, { label: "?" }]}
+          title={t("app.unknownError")}
+          description={t("novel.invalidId")}
+        />
       </PageShell>
     )
   }
@@ -507,566 +548,604 @@ export function NovelDetailPage() {
   if (error) {
     return (
       <PageShell>
-        <PageHeader title={t("app.unknownError")} />
-        <p className="text-sm text-destructive">
-          {error instanceof ApiError ? error.message : t("app.unknownError")}
-        </p>
+        <PageHeader breadcrumbs={[{ label: t("sites.title"), to: "/sites" }, { label: "?" }]} title={t("app.unknownError")} />
+        <EmptyState
+          icon={BookX}
+          tone="neutral"
+          title={error instanceof ApiError ? error.message : t("app.unknownError")}
+          action={
+            <Link to="/sites" className={buttonVariants({ variant: "outline" })}>
+              {t("common.backSites")}
+            </Link>
+          }
+        />
       </PageShell>
     )
   }
   if (isLoading || !novel) {
     return (
       <PageShell>
-        <p className="text-sm text-muted-foreground">{t("app.loading")}</p>
+        <PageSkeleton />
       </PageShell>
     )
   }
 
+  const crawledCount = novel.crawled_chapters ?? novel.last_chapter_index
+  const crawlPct = novel.total_chapters ? (crawledCount / novel.total_chapters) * 100 : null
+  const liveChapterPct =
+    progress && progress.chapter_total > 0 ? (progress.chapter_index / progress.chapter_total) * 100 : null
+
+  // ------ Hành động chính theo ngữ cảnh ------
+  const sendMenuItems = (
+    <>
+      <ActionMenuItem disabled={sendToTranslateMutation.isPending} onSelect={() => sendToTranslateMutation.mutate(true)}>
+        {t("novel.sendToTranslateCleaned")}
+      </ActionMenuItem>
+      <ActionMenuItem disabled={sendToTranslateMutation.isPending} onSelect={() => sendToTranslateMutation.mutate(false)}>
+        {t("novel.sendToTranslateForce")}
+      </ActionMenuItem>
+    </>
+  )
+
+  let primaryAction: ReactNode = null
+  let primaryIsRetry = false
+  if (translateWorkId != null) {
+    primaryAction = (
+      <Link to={`/translate/${translateWorkId}`} className={buttonVariants({ variant: "default" })}>
+        {t("novel.openTranslateWork")}
+        <ArrowRight className="size-4" />
+      </Link>
+    )
+  } else if (canSendToTranslate && novel.lifecycle_status !== "error") {
+    primaryAction = (
+      <ActionMenu
+        label={
+          <>
+            <Send className="size-4" />
+            {sendToTranslateMutation.isPending ? t("novel.sendingToTranslate") : t("novel.sendToTranslate")}
+          </>
+        }
+        variant="default"
+        size="default"
+        disabled={sendToTranslateMutation.isPending}
+      >
+        {sendMenuItems}
+      </ActionMenu>
+    )
+  } else if (canRetryNovel) {
+    primaryIsRetry = true
+    primaryAction = (
+      <Button disabled={retryNovelMutation.isPending} onClick={() => retryNovelMutation.mutate()}>
+        <RotateCcw className="size-4" />
+        {retryNovelMutation.isPending ? t("novel.retryingNovel") : t("novel.retryNovel")}
+      </Button>
+    )
+  } else if (novel.lifecycle_status === "rejected") {
+    primaryAction = (
+      <Button disabled={forceAcceptMutation.isPending} onClick={() => forceAcceptMutation.mutate()}>
+        {forceAcceptMutation.isPending ? t("site.processing") : t("site.forceAccept")}
+      </Button>
+    )
+  }
+  // Lỗi nhưng vẫn gửi dịch được: "Thử lại" là chính, gửi dịch vào menu phụ.
+  const sendInOverflow = canSendToTranslate && (translateWorkId != null || novel.lifecycle_status === "error")
+
+  const secondaryActions = (
+    <>
+      {exportStatus?.can_export_workbook && (
+        <ActionMenu
+          label={
+            <>
+              <Download className="size-4" />
+              {exportBusy ? t("novel.exporting") : t("novel.export")}
+            </>
+          }
+          variant="outline"
+          size="default"
+          disabled={exportBusy}
+        >
+          <ActionMenuItem disabled={exportBusy} onSelect={() => exportBundleMutation.mutate()}>
+            {t("novel.exportBundle")}
+          </ActionMenuItem>
+          <ActionMenuItem disabled={exportBusy} onSelect={() => exportWorkbookMutation.mutate()}>
+            {t("novel.exportWorkbook")}
+          </ActionMenuItem>
+          <ActionMenuItem disabled={exportBusy} onSelect={() => exportTxtMutation.mutate()}>
+            {t("novel.exportTxt")}
+          </ActionMenuItem>
+          <ActionMenuItem disabled={exportBusy} onSelect={() => exportEpubMutation.mutate()}>
+            {t("novel.exportEpub")}
+          </ActionMenuItem>
+        </ActionMenu>
+      )}
+      {!isCrawling && (
+        <ActionMenu
+          label={
+            <>
+              <MoreHorizontal className="size-4" aria-hidden />
+              <span className="sr-only">{t("novel.moreActions")}</span>
+            </>
+          }
+          variant="outline"
+          size="default"
+          showChevron={false}
+        >
+          {sendInOverflow ? sendMenuItems : null}
+          {canRetryNovel && !primaryIsRetry ? (
+            <ActionMenuItem disabled={retryNovelMutation.isPending} onSelect={() => retryNovelMutation.mutate()}>
+              {retryNovelMutation.isPending ? t("novel.retryingNovel") : t("novel.retryNovel")}
+            </ActionMenuItem>
+          ) : null}
+          <ActionMenuItem destructive disabled={deleteNovelMutation.isPending} onSelect={() => setConfirmDeleteNovel(true)}>
+            {t("novel.deleteNovel")}
+          </ActionMenuItem>
+        </ActionMenu>
+      )}
+    </>
+  )
+
+  // ------ Cảnh báo lỗi / bị loại ------
+  const showProblem =
+    Boolean(novel.error_message) ||
+    novel.lifecycle_status === "error" ||
+    novel.lifecycle_status === "rejected" ||
+    failedChapterTotal > 0
+  const problemTitle =
+    novel.lifecycle_status === "rejected"
+      ? t("novel.problemRejectedTitle")
+      : novel.lifecycle_status === "error"
+        ? t("novel.problemErrorTitle")
+        : failedChapterTotal > 0
+          ? t("novel.problemFailedTitle", { count: failedChapterTotal })
+          : t("novel.problemNoteTitle")
+  const problemExplain =
+    novel.lifecycle_status === "rejected"
+      ? t("novel.problemRejectedExplain")
+      : novel.lifecycle_status === "error"
+        ? t("novel.problemErrorExplain")
+        : t("novel.failedChaptersHint", { count: failedChapterTotal })
+
+  const stats = exportStatus && exportStatus.crawled > 0 ? exportStatus : null
+
   return (
     <PageShell>
-      <PageHeader
-        eyebrow={
-          <Link
-            to={`/sites/${novel.source_key}`}
-            className="hover:text-foreground hover:underline"
-          >
-            ← {novel.source_key}
-          </Link>
-        }
-        title={novel.title}
-        description={
-          <>
-            {novel.author ? `${novel.author} · ` : null}
-            {t("novel.progress", {
-              last: novel.last_chapter_index,
-              total: novel.total_chapters ?? "?",
-            })}
-            {novel.is_manual && t("novel.manual")}
-          </>
-        }
-        actions={
-          <>
-            <StatusBadge status={novel.lifecycle_status} />
-            {canSendToTranslate && (
-              <ActionMenu
-                label={
-                  sendToTranslateMutation.isPending
-                    ? t("novel.sendingToTranslate")
-                    : t("novel.sendToTranslate")
-                }
-                variant="default"
-                disabled={sendToTranslateMutation.isPending}
-              >
-                <ActionMenuItem
-                  disabled={sendToTranslateMutation.isPending}
-                  onSelect={() => sendToTranslateMutation.mutate(true)}
-                >
-                  {t("novel.sendToTranslateCleaned")}
-                </ActionMenuItem>
-                <ActionMenuItem
-                  disabled={sendToTranslateMutation.isPending}
-                  onSelect={() => sendToTranslateMutation.mutate(false)}
-                >
-                  {t("novel.sendToTranslateForce")}
-                </ActionMenuItem>
-              </ActionMenu>
-            )}
-            {canSmoothNovel && (
-              <ActionMenu label={t("novel.prepare")} variant="secondary" disabled={smoothMutation.isPending || reviewAllMutation.isPending}>
-                <ActionMenuItem
-                  disabled={smoothMutation.isPending}
-                  onSelect={() => smoothMutation.mutate(undefined)}
-                >
-                  {smoothMutation.isPending ? t("novel.smoothing") : t("novel.smoothAll")}
-                </ActionMenuItem>
-                <ActionMenuItem
-                  disabled={reviewAllMutation.isPending || (exportStatus?.cleaned ?? 0) === 0}
-                  onSelect={() => reviewAllMutation.mutate()}
-                >
-                  {reviewAllMutation.isPending ? t("novel.reviewingAll") : t("novel.reviewAllAction")}
-                </ActionMenuItem>
-              </ActionMenu>
-            )}
-            {exportStatus?.can_export_workbook && (
-              <ActionMenu
-                label={exportBusy ? t("novel.exporting") : t("novel.export")}
-                variant="default"
-                disabled={exportBusy}
-              >
-                <ActionMenuItem
-                  disabled={exportBusy}
-                  onSelect={() => exportBundleMutation.mutate()}
-                >
-                  {t("novel.exportBundle")}
-                </ActionMenuItem>
-                <ActionMenuItem
-                  disabled={exportBusy}
-                  onSelect={() => exportWorkbookMutation.mutate()}
-                >
-                  {t("novel.exportWorkbook")}
-                </ActionMenuItem>
-                <ActionMenuItem
-                  disabled={exportBusy}
-                  onSelect={() => exportTxtMutation.mutate()}
-                >
-                  {t("novel.exportTxt")}
-                </ActionMenuItem>
-                <ActionMenuItem
-                  disabled={exportBusy}
-                  onSelect={() => exportEpubMutation.mutate()}
-                >
-                  {t("novel.exportEpub")}
-                </ActionMenuItem>
-              </ActionMenu>
-            )}
-            {novel.lifecycle_status !== "crawling" && (
-              <ActionMenu label={t("novel.moreActions")} variant="outline">
-                {(novel.lifecycle_status === "error" || novel.lifecycle_status === "fully_crawled") && (
-                  <ActionMenuItem
-                    disabled={retryNovelMutation.isPending}
-                    onSelect={() => retryNovelMutation.mutate()}
-                  >
-                    {retryNovelMutation.isPending ? t("novel.retryingNovel") : t("novel.retryNovel")}
-                  </ActionMenuItem>
-                )}
-                <ActionMenuItem
-                  destructive
-                  disabled={deleteNovelMutation.isPending}
-                  onSelect={() => setConfirmDeleteNovel(true)}
-                >
-                  {t("novel.deleteNovel")}
-                </ActionMenuItem>
-              </ActionMenu>
-            )}
-          </>
-        }
+      <Breadcrumbs
+        items={[
+          { label: t("sites.title"), to: "/sites" },
+          { label: novel.source_key, to: `/sites/${novel.source_key}` },
+          { label: novel.title },
+        ]}
       />
 
-      {exportStatus && exportStatus.crawled > 0 && (
-        <div className="grid gap-2 sm:grid-cols-3">
-          <StatChip label={t("novel.statCrawled")} value={exportStatus.crawled} />
-          <StatChip
-            label={t("novel.statCleaned")}
-            value={exportStatus.cleaned}
-            tone={exportStatus.cleaned > 0 ? "success" : "default"}
-          />
-          <StatChip
-            label={t("novel.statReviewed")}
-            value={exportStatus.reviewed}
-            tone={exportStatus.reviewed > 0 ? "success" : "warn"}
-          />
+      {/* ------ Đầu trang kiểu sách ------ */}
+      <div className="flex flex-col gap-5 sm:flex-row sm:gap-7">
+        <div className="w-28 shrink-0 sm:w-36">
+          <BookCover title={novel.title} subtitle={novel.author || novel.source_key} url={novel.cover_url} lift={false} />
         </div>
-      )}
-
-      {pipelineStep === "smooth" && canSmoothNovel && (
-        <Card className="border-sky-500/20 bg-sky-500/5">
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-1">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">{t("novel.pipelineSmoothTitle")}</p>
-              <p className="text-xs text-muted-foreground">
-                {t("novel.pipelineSmoothDesc", {
-                  cleaned: exportStatus?.cleaned ?? 0,
-                  crawled: exportStatus?.crawled ?? 0,
-                })}
-              </p>
-            </div>
-            <Button
-              size="sm"
-              disabled={smoothMutation.isPending}
-              onClick={() => smoothMutation.mutate(undefined)}
-            >
-              {smoothMutation.isPending ? t("novel.smoothing") : t("novel.pipelineSmoothAction")}
-            </Button>
-          </CardContent>
-        </Card>
-      )}
-      {pipelineStep === "review" && (
-        <Card className="border-amber-500/20 bg-amber-500/5">
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-1">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">{t("novel.pipelineReviewTitle")}</p>
-              <p className="text-xs text-muted-foreground">
-                {t("novel.pipelineReviewDesc", {
-                  reviewed: exportStatus?.reviewed ?? 0,
-                  cleaned: exportStatus?.cleaned ?? 0,
-                })}
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button size="sm" variant="outline" onClick={() => void openFirstUnreviewed()}>
-                {t("novel.pipelineReviewAction")}
-              </Button>
-              <Button
-                size="sm"
-                variant="secondary"
-                disabled={reviewAllMutation.isPending}
-                onClick={() => reviewAllMutation.mutate()}
-              >
-                {reviewAllMutation.isPending ? t("novel.reviewingAll") : t("novel.reviewAllAction")}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-      )}
-      {pipelineStep === "export" && exportStatus?.can_export_workbook && (
-        <Card className="border-emerald-500/20 bg-emerald-500/5">
-          <CardContent className="flex flex-wrap items-center justify-between gap-3 pt-1">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">{t("novel.pipelineExportTitle")}</p>
-              <p className="text-xs text-muted-foreground">{t("novel.pipelineExportDesc")}</p>
-            </div>
-            <Button
-              size="sm"
-              disabled={exportBusy}
-              onClick={() => exportBundleMutation.mutate()}
-            >
-              {exportBundleMutation.isPending ? t("novel.exporting") : t("novel.pipelineExportAction")}
-            </Button>
-          </CardContent>
-        </Card>
-      )}
-
-      {(novel.error_message || novel.lifecycle_status === "error" || failedChapterTotal > 0) && (
-        <Alert>
-          <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
-            <span className="text-destructive">
-              {novel.error_message ||
-                (failedChapterTotal > 0
-                  ? t("novel.failedChaptersHint", { count: failedChapterTotal })
-                  : t("lifecycle.error"))}
-            </span>
-            <div className="flex flex-wrap gap-2">
-              {failedChapterTotal > 0 && (
-                <Button size="sm" variant="outline" onClick={() => applyChapterPreset("failed")}>
-                  {t("novel.presetFailed")}
-                </Button>
-              )}
-              {(novel.lifecycle_status === "error" || novel.lifecycle_status === "fully_crawled") && (
-                <Button
-                  size="sm"
-                  disabled={retryNovelMutation.isPending}
-                  onClick={() => retryNovelMutation.mutate()}
+        <div className="min-w-0 flex-1 space-y-4">
+          <PageHeader
+            eyebrow={t("sites.eyebrow")}
+            stage="collect"
+            title={novel.title}
+            meta={
+              <>
+                <StatusBadge status={novel.lifecycle_status} />
+                {novel.author ? <span>{novel.author}</span> : null}
+                <Link
+                  to={`/sites/${novel.source_key}`}
+                  className="inline-flex h-6 items-center rounded-full bg-stage-collect-soft px-2.5 text-xs font-semibold text-stage-collect hover:underline"
                 >
-                  {retryNovelMutation.isPending ? t("novel.retryingNovel") : t("novel.retryNovel")}
-                </Button>
-              )}
+                  {novel.source_key}
+                </Link>
+                {novel.is_manual ? (
+                  <span className="inline-flex h-6 items-center rounded-full bg-muted px-2.5 text-xs font-semibold text-muted-foreground">
+                    {t("novel.manualChip")}
+                  </span>
+                ) : null}
+              </>
+            }
+            secondaryActions={secondaryActions}
+            primaryAction={primaryAction}
+          />
+
+          <div className="max-w-xl space-y-1.5">
+            <div className="flex flex-wrap items-baseline justify-between gap-2 text-[13px] text-muted-foreground">
+              <span>{t("novel.chaptersCrawled")}</span>
+              <span className="font-mono tabular-nums">
+                <span className="text-foreground">{crawledCount}</span>/{novel.total_chapters ?? "?"}
+                {crawlPct != null ? ` · ${Math.round(crawlPct)}%` : ""}
+                {novel.failed_chapters ? (
+                  <span className="text-danger">
+                    {" · "}
+                    {novel.failed_chapters} {t("novel.failedShort")}
+                  </span>
+                ) : null}
+              </span>
             </div>
+            <Progress
+              value={crawlPct}
+              tone={novel.lifecycle_status === "error" ? "danger" : "collect"}
+              live={isCrawling}
+              label={t("novel.chaptersCrawled")}
+            />
+            {isCrawling ? (
+              <p className="flex items-center gap-2 text-[13px] text-muted-foreground">
+                <span aria-hidden className="dot-live size-1.5 rounded-full bg-live" />
+                {progress?.chapter_total
+                  ? t("novel.liveChapter", { index: progress.chapter_index, total: progress.chapter_total })
+                  : progress?.message || t("novel.emptyCrawling")}
+                {liveChapterPct != null ? <span className="font-mono">({Math.round(liveChapterPct)}%)</span> : null}
+              </p>
+            ) : null}
+          </div>
+        </div>
+      </div>
+
+      {/* ------ Lỗi / bị loại ------ */}
+      {showProblem && (
+        <Alert
+          variant={novel.lifecycle_status === "rejected" ? "default" : "destructive"}
+          className={cn(
+            "gap-y-1.5 px-4 py-3.5 has-data-[slot=alert-action]:pr-4 sm:has-data-[slot=alert-action]:pr-72",
+            novel.lifecycle_status === "rejected" ? "bg-muted/50" : "border-danger/25 bg-danger-soft",
+          )}
+        >
+          <AlertTriangle className={novel.lifecycle_status === "rejected" ? "text-muted-foreground" : "text-danger"} />
+          <AlertTitle className="text-foreground">{problemTitle}</AlertTitle>
+          <AlertDescription className="space-y-2 text-foreground/80">
+            <p>{problemExplain}</p>
+            {novel.error_message ? (
+              <p className="rounded-lg bg-card/70 px-3 py-2 font-mono text-[13px] break-words text-foreground">
+                {novel.error_message}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-2 pt-1 sm:hidden">{problemActions()}</div>
           </AlertDescription>
+          <AlertAction className="top-3.5 right-4 hidden flex-wrap justify-end gap-2 sm:flex">{problemActions()}</AlertAction>
         </Alert>
       )}
 
-      {canSmoothNovel && (
-        <Card>
-          <CardContent className="space-y-3 pt-1">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0 space-y-1">
-                <p className="text-sm font-medium">{t("novel.smoothTitle")}</p>
-                <p className="text-xs text-muted-foreground">{t("novel.smoothHint")}</p>
-              </div>
-              <Button
-                size="sm"
-                disabled={smoothMutation.isPending}
-                onClick={() => smoothMutation.mutate(undefined)}
-                title={t("novel.smoothAllTitle")}
-              >
-                {smoothMutation.isPending && selectedCount === 0
-                  ? t("novel.smoothing")
-                  : t("novel.smoothAll")}
-              </Button>
+      {/* ------ Chuẩn bị bản dịch: số liệu + bước kế tiếp + làm mượt ------ */}
+      {(stats || canSmoothNovel) && (
+        <section className="space-y-4 rounded-2xl border bg-card p-5 shadow-[0_1px_2px_rgb(16_22_20/0.04)]">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 space-y-0.5">
+              <h2 className="text-[17px] font-semibold">{t("novel.prepareTitle")}</h2>
+              <p className="text-[13px] text-muted-foreground">{t("novel.smoothHint")}</p>
             </div>
-            {selectedCount > 0 && (
-              <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2.5 text-sm">
-                <span className="font-medium text-foreground">
-                  {t("novel.selectedCount", { count: selectedCount })}
-                </span>
+            {canSmoothNovel ? (
+              <div className="flex flex-wrap gap-2">
                 <Button
-                  size="sm"
-                  disabled={smoothMutation.isPending}
-                  onClick={() => smoothMutation.mutate(Array.from(selectedIds))}
-                >
-                  {smoothMutation.isPending ? t("novel.smoothing") : t("novel.smoothSelected")}
-                </Button>
-                <Button
-                  size="sm"
                   variant="outline"
-                  disabled={selectingAll || smoothMutation.isPending}
-                  onClick={() => void selectAllCrawledChapters()}
+                  disabled={smoothMutation.isPending}
+                  onClick={() => smoothMutation.mutate({})}
+                  title={t("novel.smoothAllTitle")}
                 >
-                  {selectingAll ? t("novel.selecting") : t("novel.selectAllPages")}
+                  <Wand2 className="size-4" />
+                  {smoothMutation.isPending && selectedCount === 0 ? t("novel.smoothing") : t("novel.smoothAll")}
                 </Button>
                 <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={smoothMutation.isPending}
-                  onClick={() => setSelectedIds(new Set())}
+                  variant="outline"
+                  disabled={reviewAllMutation.isPending || (exportStatus?.cleaned ?? 0) === 0}
+                  onClick={() => reviewAllMutation.mutate()}
                 >
-                  {t("novel.clearSelection")}
+                  <ListChecks className="size-4" />
+                  {reviewAllMutation.isPending ? t("novel.reviewingAll") : t("novel.reviewAllAction")}
                 </Button>
               </div>
-            )}
-            {lastSmoothSummary && (
-              <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-sm">
-                <p>{lastSmoothSummary}</p>
-              </div>
-            )}
-          </CardContent>
-        </Card>
+            ) : null}
+          </div>
+
+          {stats ? (
+            <div className="grid gap-3 sm:grid-cols-3">
+              <StatMeter label={t("novel.statCrawled")} value={stats.crawled} total={novel.total_chapters ?? stats.crawled} tone="collect" />
+              <StatMeter label={t("novel.statCleaned")} value={stats.cleaned} total={stats.crawled} tone="translate" />
+              <StatMeter label={t("novel.statReviewed")} value={stats.reviewed} total={stats.cleaned || stats.crawled} tone="primary" />
+            </div>
+          ) : null}
+
+          {pipelineStep === "smooth" && canSmoothNovel && (
+            <NextStep
+              icon={<Wand2 className="size-4" />}
+              title={t("novel.pipelineSmoothTitle")}
+              desc={t("novel.pipelineSmoothDesc", { cleaned: exportStatus?.cleaned ?? 0, crawled: exportStatus?.crawled ?? 0 })}
+            >
+              <Button size="sm" disabled={smoothMutation.isPending} onClick={() => smoothMutation.mutate({})}>
+                {smoothMutation.isPending ? t("novel.smoothing") : t("novel.pipelineSmoothAction")}
+              </Button>
+            </NextStep>
+          )}
+          {pipelineStep === "review" && (
+            <NextStep
+              icon={<ListChecks className="size-4" />}
+              title={t("novel.pipelineReviewTitle")}
+              desc={t("novel.pipelineReviewDesc", { reviewed: exportStatus?.reviewed ?? 0, cleaned: exportStatus?.cleaned ?? 0 })}
+            >
+              <Button size="sm" onClick={() => void openFirstUnreviewed()}>
+                {t("novel.pipelineReviewAction")}
+              </Button>
+            </NextStep>
+          )}
+          {pipelineStep === "export" && exportStatus?.can_export_workbook && (
+            <NextStep icon={<Download className="size-4" />} title={t("novel.pipelineExportTitle")} desc={t("novel.pipelineExportDesc")}>
+              <Button size="sm" disabled={exportBusy} onClick={() => exportBundleMutation.mutate()}>
+                {exportBundleMutation.isPending ? t("novel.exporting") : t("novel.pipelineExportAction")}
+              </Button>
+            </NextStep>
+          )}
+
+          {lastSmooth && (
+            <div className="space-y-2 rounded-xl bg-success-soft px-4 py-3 text-sm">
+              <p className="flex items-center gap-2 font-medium">
+                <Sparkles className="size-4 text-success" aria-hidden />
+                {lastSmooth.summary}
+              </p>
+              {lastSmooth.protectedCount > 0 ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[13px] text-muted-foreground">
+                  <span>{t("novel.smoothProtected", { count: lastSmooth.protectedCount })}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={smoothMutation.isPending}
+                    onClick={() => void smoothForce(lastSmooth.chapterIds)}
+                  >
+                    {t("novel.smoothForce")}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          )}
+        </section>
       )}
 
-      <div className="flex flex-wrap items-center gap-2">
-        {CHAPTER_PRESETS.map((preset) => (
-          <Button
-            key={preset}
-            type="button"
-            size="sm"
-            variant={activePreset === preset ? "default" : "outline"}
-            onClick={() => applyChapterPreset(preset)}
-          >
-            {preset === "all"
-              ? t("novel.presetAll")
-              : preset === "need_smooth"
-                ? t("novel.presetNeedSmooth")
-                : preset === "need_review"
-                  ? t("novel.presetNeedReview")
-                  : t("novel.presetFailed")}
-            {preset === "failed" && failedChapterTotal > 0 ? ` (${failedChapterTotal})` : ""}
-          </Button>
-        ))}
+      <div className="grid gap-4 lg:grid-cols-2 [&:empty]:hidden">
+        <PipelineCard novelId={novel.id} enabled={canSendToTranslate} />
+        <FollowCard novelId={novel.id} status={novel.lifecycle_status} />
       </div>
 
-      <div className="flex flex-wrap items-center gap-3 rounded-xl bg-muted/40 p-3 ring-1 ring-border">
-        <Select
-          value={statusFilter}
-          onValueChange={(v) => v && setStatusFilter(v as typeof statusFilter)}
-        >
-          <SelectTrigger className="h-9 w-44 bg-background">
-            <SelectValue>
-              {(v: string) => statusOptions.find((o) => o.value === v)?.label ?? v}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {statusOptions.map((s) => (
-              <SelectItem key={s.value} value={s.value}>
-                {s.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select
-          value={reviewFilter}
-          onValueChange={(v) => v && setReviewFilter(v as typeof reviewFilter)}
-        >
-          <SelectTrigger className="h-9 w-44 bg-background">
-            <SelectValue>
-              {(v: string) => reviewOptions.find((o) => o.value === v)?.label ?? v}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {reviewOptions.map((s) => (
-              <SelectItem key={s.value} value={s.value}>
-                {s.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Select
-          value={cleanedFilter}
-          onValueChange={(v) => v && setCleanedFilter(v as typeof cleanedFilter)}
-        >
-          <SelectTrigger className="h-9 w-44 bg-background">
-            <SelectValue>
-              {(v: string) => cleanedOptions.find((o) => o.value === v)?.label ?? v}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            {cleanedOptions.map((s) => (
-              <SelectItem key={s.value} value={s.value}>
-                {s.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Input
-          type="search"
-          placeholder={t("novel.searchChapters")}
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="h-9 min-w-[12rem] flex-1 bg-background sm:max-w-xs"
-        />
-        {total > 0 && (
-          <span className="ml-auto text-xs text-muted-foreground">
-            {t("common.range", { from, to, total })}
-            {isFetching ? "…" : ""}
-          </span>
+      {/* ------ Chương ------ */}
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h2 className="text-[17px] font-semibold">{t("novel.chaptersTitle")}</h2>
+          {total > 0 && (
+            <span className="font-mono text-[13px] text-muted-foreground tabular-nums">
+              {t("common.range", { from, to, total })}
+              {isFetching ? " …" : ""}
+            </span>
+          )}
+        </div>
+
+        {/* Thanh lọc gộp: preset + tìm + lọc chi tiết */}
+        <div className="space-y-3 rounded-2xl border bg-card p-3">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+            <SegmentedTabs
+              value={activePreset}
+              onChange={(v) => v !== "custom" && applyChapterPreset(v)}
+              items={[
+                { value: "all", label: t("novel.presetAll") },
+                { value: "need_smooth", label: t("novel.presetNeedSmooth") },
+                { value: "need_review", label: t("novel.presetNeedReview") },
+                { value: "failed", label: t("novel.presetFailed"), count: failedChapterTotal > 0 ? failedChapterTotal : undefined },
+                ...(activePreset === "custom" ? [{ value: "custom" as const, label: t("novel.presetCustom") }] : []),
+              ]}
+            />
+            <div className="relative min-w-0 flex-1">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                type="search"
+                placeholder={t("novel.searchChapters")}
+                aria-label={t("novel.searchChapters")}
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="h-10 pl-9"
+              />
+            </div>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <Select value={statusFilter} onValueChange={(v) => v && setStatusFilter(v as typeof statusFilter)}>
+              <SelectTrigger className="h-9 w-full" aria-label={t("novel.colStatus")}>
+                <SelectValue>{(v: string) => statusOptions.find((o) => o.value === v)?.label ?? v}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {statusOptions.map((s) => (
+                  <SelectItem key={s.value} value={s.value}>
+                    {s.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={cleanedFilter} onValueChange={(v) => v && setCleanedFilter(v as typeof cleanedFilter)}>
+              <SelectTrigger className="h-9 w-full" aria-label={t("novel.colSmooth")}>
+                <SelectValue>{(v: string) => cleanedOptions.find((o) => o.value === v)?.label ?? v}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {cleanedOptions.map((s) => (
+                  <SelectItem key={s.value} value={s.value}>
+                    {s.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={reviewFilter} onValueChange={(v) => v && setReviewFilter(v as typeof reviewFilter)}>
+              <SelectTrigger className="h-9 w-full" aria-label={t("novel.colReview")}>
+                <SelectValue>{(v: string) => reviewOptions.find((o) => o.value === v)?.label ?? v}</SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {reviewOptions.map((s) => (
+                  <SelectItem key={s.value} value={s.value}>
+                    {s.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+
+        {/* Thanh chọn hàng loạt */}
+        {selectedCount > 0 && canSmoothNovel && (
+          <div className="flex flex-wrap items-center gap-2 rounded-xl bg-accent px-3 py-2.5 text-sm text-accent-foreground">
+            <span className="font-semibold">{t("novel.selectedCount", { count: selectedCount })}</span>
+            <span className="flex-1" />
+            <Button size="sm" disabled={smoothMutation.isPending} onClick={() => smoothMutation.mutate({ chapterIds: Array.from(selectedIds) })}>
+              {smoothMutation.isPending ? t("novel.smoothing") : t("novel.smoothSelected")}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={smoothMutation.isPending}
+              onClick={() => void smoothForce(Array.from(selectedIds))}
+            >
+              {t("novel.smoothForce")}
+            </Button>
+            <Button size="sm" variant="outline" disabled={selectingAll || smoothMutation.isPending} onClick={() => void selectAllCrawledChapters()}>
+              {selectingAll ? t("novel.selecting") : t("novel.selectAllPages")}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={smoothMutation.isPending} onClick={() => setSelectedIds(new Set())}>
+              {t("novel.clearSelection")}
+            </Button>
+          </div>
         )}
-      </div>
 
-      {chaptersError && (
-        <p className="text-sm text-destructive">
-          {chaptersError instanceof ApiError ? chaptersError.message : t("app.unknownError")}
-        </p>
-      )}
+        {chaptersError && (
+          <p className="text-sm text-destructive">
+            {chaptersError instanceof ApiError ? chaptersError.message : t("app.unknownError")}
+          </p>
+        )}
 
-      <Card className="overflow-hidden py-0">
-        <div className="overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-10 px-2">
-                <Checkbox
-                  checked={allSmoothableSelected}
-                  indeterminate={someSmoothableSelected}
-                  disabled={!canSmoothNovel || smoothableOnPage.length === 0 || smoothMutation.isPending}
-                  onCheckedChange={(checked) => toggleAllOnPage(checked === true)}
-                  aria-label={t("novel.selectAllPage")}
-                />
-              </TableHead>
-              <TableHead className="w-12">#</TableHead>
-              <TableHead>{t("novel.colTitle")}</TableHead>
-              <TableHead>{t("novel.colStatus")}</TableHead>
-              <TableHead>{t("novel.colSmooth")}</TableHead>
-              <TableHead>{t("novel.colReview")}</TableHead>
-              <TableHead>{t("novel.colError")}</TableHead>
-              <TableHead className="text-right">{t("novel.colActions")}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {chapters.map((ch) => {
-              const smoothable = canSmoothChapter(ch)
-              return (
-                <TableRow key={ch.id} data-state={selectedIds.has(ch.id) ? "selected" : undefined}>
-                  <TableCell className="px-2">
-                    <Checkbox
-                      checked={selectedIds.has(ch.id)}
-                      disabled={!canSmoothNovel || !smoothable || smoothMutation.isPending}
-                      onCheckedChange={(v) => toggleOne(ch.id, v === true)}
-                      aria-label={t("novel.selectChapter", { index: ch.chapter_index })}
-                    />
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">{ch.chapter_index}</TableCell>
-                  <TableCell className="font-medium">{ch.title}</TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">
-                      {ch.status === "pending"
-                        ? t("novel.statusPending")
-                        : ch.status === "crawled"
-                          ? t("novel.statusCrawled")
-                          : ch.status === "failed"
-                            ? t("novel.statusError")
-                            : ch.status}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    {ch.has_cleaned ? (
-                      <Badge className="bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-200">
-                        {t("novel.badgeCleaned")}
-                      </Badge>
-                    ) : (
-                      <Badge variant="outline" className="text-muted-foreground">
-                        {t("novel.badgeDash")}
-                      </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    {ch.reviewed ? (
-                      <Badge className="bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-300">
-                        {t("novel.badgeReviewed")}
-                      </Badge>
-                    ) : (
-                      <Badge variant="outline" className="text-muted-foreground">
-                        {t("novel.badgeUnreviewed")}
-                      </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell className="text-xs text-destructive">{ch.error_message ?? ""}</TableCell>
-                  <TableCell className="text-right whitespace-nowrap">
-                    <div className="inline-flex items-center justify-end gap-1">
-                      {ch.status === "crawled" && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => setReviewingChapter({ id: ch.id, title: ch.title })}
-                        >
-                          {t("novel.btnReview")}
-                        </Button>
-                      )}
-                      {(ch.status === "failed" || ch.status === "unsupported") && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={retryChapterMutation.isPending && retryChapterMutation.variables === ch.id}
-                          onClick={() => retryChapterMutation.mutate(ch.id)}
-                        >
-                          {retryChapterMutation.isPending && retryChapterMutation.variables === ch.id
-                            ? t("novel.crawling")
-                            : t("novel.btnRetry")}
-                        </Button>
-                      )}
-                      {(smoothable && canSmoothNovel) || novel.lifecycle_status !== "crawling" ? (
-                        <ActionMenu label="⋯" size="sm" variant="ghost" align="end" showChevron={false}>
-                          {smoothable && canSmoothNovel ? (
-                            <ActionMenuItem
-                              disabled={smoothMutation.isPending}
-                              onSelect={() => smoothMutation.mutate([ch.id])}
-                            >
-                              {t("novel.btnSmooth")}
-                            </ActionMenuItem>
-                          ) : null}
-                          {novel.lifecycle_status !== "crawling" ? (
-                            <ActionMenuItem
-                              destructive
-                              disabled={
-                                deleteChapterMutation.isPending &&
-                                deleteChapterMutation.variables === ch.id
-                              }
-                              onSelect={() => setConfirmDeleteChapterId(ch.id)}
-                            >
-                              {t("novel.deleteChapter")}
-                            </ActionMenuItem>
-                          ) : null}
-                        </ActionMenu>
-                      ) : null}
+        {chapters.length === 0 ? (
+          <div className="rounded-2xl border border-dashed bg-card">
+            <EmptyState
+              compact
+              icon={ListChecks}
+              tone="collect"
+              title={
+                isCrawling && statusFilter === "all" && !debouncedSearch ? t("novel.emptyCrawling") : t("novel.emptyFilter")
+              }
+              action={
+                activePreset !== "all" || debouncedSearch ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      applyChapterPreset("all")
+                      setSearch("")
+                    }}
+                  >
+                    {t("sites.clearFilters")}
+                  </Button>
+                ) : undefined
+              }
+            />
+          </div>
+        ) : (
+          <>
+            {/* Mobile: thẻ */}
+            <ul className="space-y-2 md:hidden">
+              {chapters.map((ch) => {
+                const smoothable = canSmoothChapter(ch)
+                const checked = selectedIds.has(ch.id)
+                return (
+                  <li key={ch.id} className={cn("rounded-2xl border bg-card p-3.5", checked && "border-primary/40 bg-accent/40")}>
+                    <div className="flex items-start gap-3">
+                      <Checkbox
+                        className="mt-1"
+                        checked={checked}
+                        disabled={!canSmoothNovel || !smoothable || smoothMutation.isPending}
+                        onCheckedChange={(v) => toggleOne(ch.id, v === true)}
+                        aria-label={t("novel.selectChapter", { index: ch.chapter_index })}
+                      />
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <p className="leading-snug font-semibold">
+                          <span className="mr-1.5 font-mono text-xs text-muted-foreground">{ch.chapter_index}</span>
+                          {ch.title}
+                        </p>
+                        <ChapterPills ch={ch} />
+                        {ch.error_message ? <p className="text-[13px] break-words text-danger">{ch.error_message}</p> : null}
+                      </div>
                     </div>
-                  </TableCell>
-                </TableRow>
-              )
-            })}
-            {chapters.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={8} className="py-6 text-center text-sm text-muted-foreground">
-                  {novel.lifecycle_status === "crawling" && statusFilter === "all" && !debouncedSearch
-                    ? t("novel.emptyCrawling")
-                    : t("novel.emptyFilter")}
-                </TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        </div>
-      </Card>
+                    <div className="mt-2 flex justify-end">{chapterActions(ch)}</div>
+                  </li>
+                )
+              })}
+            </ul>
 
-      {total > PAGE_SIZE && (
-        <div className="flex items-center justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={offset === 0}
-            onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-          >
-            {t("common.prev")}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={offset + PAGE_SIZE >= total}
-            onClick={() => setOffset((o) => o + PAGE_SIZE)}
-          >
-            {t("common.next")}
-          </Button>
-        </div>
-      )}
+            {/* Desktop: bảng với header dính */}
+            <div className="hidden max-h-[70vh] overflow-auto rounded-2xl border bg-card md:block">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 bg-muted text-left text-xs font-semibold tracking-[0.06em] text-muted-foreground uppercase shadow-[0_1px_0_var(--color-border)]">
+                  <tr>
+                    <th className="w-10 px-3 py-3">
+                      <Checkbox
+                        checked={allSmoothableSelected}
+                        indeterminate={someSmoothableSelected}
+                        disabled={!canSmoothNovel || smoothableOnPage.length === 0 || smoothMutation.isPending}
+                        onCheckedChange={(checked) => toggleAllOnPage(checked === true)}
+                        aria-label={t("novel.selectAllPage")}
+                      />
+                    </th>
+                    <th className="w-14 px-2 py-3">#</th>
+                    <th className="w-[45%] px-3 py-3">{t("novel.colTitle")}</th>
+                    <th className="px-3 py-3">{t("novel.colStatus")}</th>
+                    <th className="px-3 py-3">{t("novel.colSmooth")}</th>
+                    <th className="px-3 py-3">{t("novel.colReview")}</th>
+                    <th className="px-3 py-3 text-right">{t("novel.colActions")}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {chapters.map((ch) => {
+                    const smoothable = canSmoothChapter(ch)
+                    const checked = selectedIds.has(ch.id)
+                    return (
+                      <tr key={ch.id} className={cn("transition-colors hover:bg-muted/40", checked && "bg-accent/40")}>
+                        <td className="px-3 py-2.5">
+                          <Checkbox
+                            checked={checked}
+                            disabled={!canSmoothNovel || !smoothable || smoothMutation.isPending}
+                            onCheckedChange={(v) => toggleOne(ch.id, v === true)}
+                            aria-label={t("novel.selectChapter", { index: ch.chapter_index })}
+                          />
+                        </td>
+                        <td className="px-2 py-2.5 font-mono text-xs text-muted-foreground tabular-nums">{ch.chapter_index}</td>
+                        <td className="max-w-0 px-3 py-2.5">
+                          <p className="truncate font-medium" title={ch.title}>
+                            {ch.title}
+                          </p>
+                          {ch.error_message ? (
+                            <p className="truncate text-[13px] text-danger" title={ch.error_message}>
+                              {ch.error_message}
+                            </p>
+                          ) : null}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <ChapterStatusPill status={ch.status} />
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <SmoothPill ch={ch} />
+                        </td>
+                        <td className="px-3 py-2.5">
+                          <ReviewPill ch={ch} />
+                        </td>
+                        <td className="px-3 py-2.5 text-right whitespace-nowrap">{chapterActions(ch)}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {total > PAGE_SIZE && (
+          <div className="flex items-center justify-end gap-2">
+            <Button type="button" variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}>
+              {t("common.prev")}
+            </Button>
+            <Button type="button" variant="outline" size="sm" disabled={offset + PAGE_SIZE >= total} onClick={() => setOffset((o) => o + PAGE_SIZE)}>
+              {t("common.next")}
+            </Button>
+          </div>
+        )}
+      </section>
 
       {reviewingChapter && (
         <ChapterReviewDialog
@@ -1103,6 +1182,169 @@ export function NovelDetailPage() {
           if (confirmDeleteChapterId != null) deleteChapterMutation.mutate(confirmDeleteChapterId)
         }}
       />
+      {confirmDialog}
     </PageShell>
+  )
+
+  function problemActions() {
+    if (!novel) return null
+    return (
+      <>
+        {failedChapterTotal > 0 && (
+          <Button size="sm" variant="outline" onClick={() => applyChapterPreset("failed")}>
+            {t("novel.showFailed")}
+          </Button>
+        )}
+        {novel.lifecycle_status === "rejected" && primaryAction == null ? (
+          <Button size="sm" variant="outline" disabled={forceAcceptMutation.isPending} onClick={() => forceAcceptMutation.mutate()}>
+            {t("site.forceAccept")}
+          </Button>
+        ) : null}
+        {canRetryNovel && novel.lifecycle_status !== "error" && (
+          <Button size="sm" variant="outline" disabled={retryNovelMutation.isPending} onClick={() => retryNovelMutation.mutate()}>
+            {retryNovelMutation.isPending ? t("novel.retryingNovel") : t("novel.retryNovel")}
+          </Button>
+        )}
+      </>
+    )
+  }
+
+  function chapterActions(ch: Chapter) {
+    if (!novel) return null
+    const smoothable = canSmoothChapter(ch)
+    const retrying = retryChapterMutation.isPending && retryChapterMutation.variables === ch.id
+    const showMenu = (smoothable && canSmoothNovel) || novel.lifecycle_status !== "crawling"
+    return (
+      <div className="inline-flex items-center justify-end gap-1">
+        {ch.status === "crawled" && (
+          <Button size="sm" variant="outline" onClick={() => setReviewingChapter({ id: ch.id, title: ch.title })}>
+            {t("novel.btnReview")}
+          </Button>
+        )}
+        {(ch.status === "failed" || ch.status === "unsupported") && (
+          <Button size="sm" variant="outline" disabled={retrying} onClick={() => retryChapterMutation.mutate(ch.id)}>
+            <RotateCcw className="size-3.5" />
+            {retrying ? t("novel.crawling") : t("novel.btnRetry")}
+          </Button>
+        )}
+        {showMenu ? (
+          <ActionMenu
+            label={
+              <>
+                <MoreHorizontal className="size-4" aria-hidden />
+                <span className="sr-only">{t("novel.moreActions")}</span>
+              </>
+            }
+            size="sm"
+            variant="ghost"
+            align="end"
+            showChevron={false}
+          >
+            {smoothable && canSmoothNovel ? (
+              <>
+                <ActionMenuItem disabled={smoothMutation.isPending} onSelect={() => smoothMutation.mutate({ chapterIds: [ch.id] })}>
+                  {t("novel.btnSmooth")}
+                </ActionMenuItem>
+                {ch.reviewed ? (
+                  <ActionMenuItem disabled={smoothMutation.isPending} onSelect={() => void smoothForce([ch.id])}>
+                    {t("novel.smoothForce")}
+                  </ActionMenuItem>
+                ) : null}
+              </>
+            ) : null}
+            {novel.lifecycle_status !== "crawling" ? (
+              <ActionMenuItem
+                destructive
+                disabled={deleteChapterMutation.isPending && deleteChapterMutation.variables === ch.id}
+                onSelect={() => setConfirmDeleteChapterId(ch.id)}
+              >
+                {t("novel.deleteChapter")}
+              </ActionMenuItem>
+            ) : null}
+          </ActionMenu>
+        ) : null}
+      </div>
+    )
+  }
+}
+
+function SmoothPill({ ch }: { ch: Chapter }) {
+  const t = useT()
+  return ch.has_cleaned ? (
+    <StatusPill status="smoothed" tone="info" label={t("novel.badgeCleaned")} live={false} />
+  ) : (
+    <StatusPill status="raw" tone="neutral" label={t("novel.badgeRaw")} />
+  )
+}
+
+function ReviewPill({ ch }: { ch: Chapter }) {
+  const t = useT()
+  return ch.reviewed ? (
+    <StatusPill status="reviewed" tone="success" label={t("novel.badgeReviewed")} />
+  ) : (
+    <StatusPill status="unreviewed" tone="neutral" label={t("novel.badgeUnreviewed")} />
+  )
+}
+
+function ChapterPills({ ch }: { ch: Chapter }) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      <ChapterStatusPill status={ch.status} />
+      <SmoothPill ch={ch} />
+      <ReviewPill ch={ch} />
+    </div>
+  )
+}
+
+function StatMeter({
+  label,
+  value,
+  total,
+  tone,
+}: {
+  label: string
+  value: number
+  total: number
+  tone: "collect" | "translate" | "primary"
+}) {
+  const pct = total > 0 ? (value / total) * 100 : 0
+  return (
+    <div className="space-y-2 rounded-xl bg-muted/50 px-4 py-3">
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-xs font-semibold tracking-[0.08em] text-muted-foreground uppercase">{label}</span>
+        <span className="font-mono text-xl font-medium tabular-nums">
+          {value}
+          <span className="text-sm text-muted-foreground">/{total}</span>
+        </span>
+      </div>
+      <Progress value={pct} tone={tone} size="sm" label={label} />
+    </div>
+  )
+}
+
+function NextStep({
+  icon,
+  title,
+  desc,
+  children,
+}: {
+  icon: ReactNode
+  title: string
+  desc: string
+  children: ReactNode
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-primary/20 bg-accent/60 px-4 py-3">
+      <div className="flex min-w-0 items-start gap-3">
+        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-card text-accent-foreground">
+          {icon}
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold">{title}</p>
+          <p className="text-[13px] text-muted-foreground">{desc}</p>
+        </div>
+      </div>
+      {children}
+    </div>
   )
 }

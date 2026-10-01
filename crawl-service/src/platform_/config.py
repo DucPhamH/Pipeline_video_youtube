@@ -35,13 +35,25 @@ class AppConfig(BaseSettings):
     license_key: str = ""
 
     # --- CORS cho React FE (chạy port khác, vd 5173/3000) ---
-    cors_allow_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    cors_allow_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
     # --- Crawl runtime ---
     raw_dir: Path = DATA_DIR / "raw"
     cleaned_dir: Path = DATA_DIR / "cleaned"
     fixtures_dir: Path = DATA_DIR / "fixtures"
     request_delay_sec: float = 1.0
+    # Nguồn `demo_local` đọc file trên đĩa — chỉ bật cho test/dev
+    # (CRAWL_ENABLE_DEMO_SOURCE=true). Tắt mặc định: dry-run/thêm truyện với
+    # demo_local từng đọc được file bất kỳ.
+    crawl_enable_demo_source: bool = False
+    # Cho phép fetch tới IP private/loopback (site chạy nội bộ khi dev). Mặc
+    # định chặn — chống SSRF qua URL người dùng dán vào / redirect.
+    crawl_allow_private_fetch: bool = False
 
     # Proxy (vn thường cần exit VN) — xem proxy_pool.py / .env.example.
     # Giá trị cũng đọc trực tiếp từ env trong proxy_pool (CRAWL_HTTP_PROXY…).
@@ -55,13 +67,27 @@ class AppConfig(BaseSettings):
     crawl_hour: int = 6
     crawl_minute: int = 0
     crawl_enabled: bool = True
+    # Múi giờ so lịch quét hàng ngày (IANA, vd "Asia/Ho_Chi_Minh"). Rỗng =
+    # giờ local của tiến trình (biến TZ của OS / container).
+    scheduler_tz: str = ""
 
     # --- Translate handoff (P2) ---
     # Docker: http://translate-service:8000 ; local: http://localhost:8010
     # (8001 thường bị service khác chiếm trên máy dev)
     translate_service_url: str = "http://localhost:8010"
+    # Docker: http://tts-service:8000 ; local: http://localhost:8011
+    tts_service_url: str = "http://localhost:8011"
     # URL crawl tự publish để translate callback (Docker: http://crawl-service:8000)
     crawl_public_url: str = "http://localhost:8090"
+
+    # --- Auth đơn giản dùng chung các service ---
+    # Đặt FOLIO_API_TOKEN thì mọi route (trừ /api/health, docs) đòi header
+    # `X-Folio-Token: <token>` hoặc `Authorization: Bearer <token>` (GET tải
+    # file nhận thêm `?token=`). Rỗng = không kiểm tra (tương thích ngược).
+    folio_api_token: str = ""
+
+    # Webhook thông báo tới IP private (vd n8n nội bộ) — mặc định chặn.
+    notify_allow_private_webhook: bool = False
 
 
 config = AppConfig()

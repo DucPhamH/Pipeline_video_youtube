@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Đặt tên sản phẩm là Folio.** Giao diện, favicon và tài liệu không còn gọi cả hệ thống là Crawl Service. `crawl-service` vẫn là service cào.
 - **Xoay key cùng model (vượt AiNiee-style gap):** job 1 AI snapshot **mọi** key từ Settings (không cần tick «dùng tất cả key»). Mỗi chương round-robin + khi 429 thì cooldown key đó và thử key khác **ngay trong cùng chương** (cùng model → giữ context tuần tự). Pool nhiều key: slot bị 429 cũng failover sang sibling key cùng AI. Resume pool refresh key/URL từng slot từ registry (giữ model snapshot).
 - **Glossary / context cứng hơn:** bỏ qua seed/extract LLM khi Work đã ≥8 thuật ngữ (đỡ đốt token); `SKIPPED_CACHE` vẫn cập nhật `story_state` nếu đang track; bật `track_story_state` thì mode `full` cũng nhận rolling đuôi chương trước.
 - **Fix: đổi chỉ model (PATCH/resume) không còn gỡ `ai_provider_id`:** trước đây gửi `{model: ...}` bị coi là override tay → job mất link registry → lần «Dịch lại» sau không refresh được key từ Settings. Giờ chỉ tách khi override provider/base_url/api_key; model-level vẫn gắn AI đã lưu. FE Job Detail khi đổi model cũng gửi kèm `ai_provider_id` hiện tại.

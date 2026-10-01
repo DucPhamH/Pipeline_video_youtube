@@ -112,6 +112,13 @@ class Chapter:
     # thì vô dụng, nên cần theo dõi việc này (mục "review chương").
     reviewed: bool = False
     created_at: dt.datetime = field(default_factory=dt.datetime.utcnow)
+    # Vị trí trong mục lục site lần sync gần nhất (thứ tự đọc). None = chưa
+    # biết -> dùng chapter_index. chapter_index vẫn là định danh ổn định.
+    toc_order: int | None = None
+
+    @property
+    def sort_key(self) -> tuple[int, int]:
+        return (self.toc_order if self.toc_order is not None else self.chapter_index, self.chapter_index)
 
     def mark_crawled(self, raw_path: str) -> None:
         self.raw_path = raw_path
@@ -169,6 +176,15 @@ class Novel:
         raise DomainError(
             f"Không thể crawl bổ sung novel {self.id} đang ở trạng thái {self.lifecycle_status}"
         )
+
+    def start_follow_sync(self) -> None:
+        """Truyện đang theo dõi có chương mới — được cào thêm cả khi đã gửi dịch.
+        Quét genre vẫn bỏ qua truyện đã gửi dịch (xem start_incremental_crawl)."""
+        if self.lifecycle_status in (NovelLifecycle.TRANSLATING, NovelLifecycle.READY_FOR_VIDEO):
+            self.lifecycle_status = NovelLifecycle.CRAWLING
+            self.error_message = None
+            return
+        self.start_incremental_crawl()
 
     def advance_chapter(self, chapter_index: int) -> None:
         """Gọi ngay sau khi 1 chương crawl xong — cho phép resume nếu lỗi giữa chừng."""

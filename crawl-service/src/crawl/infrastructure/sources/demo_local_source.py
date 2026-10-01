@@ -18,7 +18,17 @@ class DemoLocalSource:
     is_test = True
 
     def __init__(self, fixtures_dir: Path):
-        self.novel_dir = fixtures_dir / "demo_novel"
+        self.fixtures_dir = Path(fixtures_dir)
+        self.novel_dir = self.fixtures_dir / "demo_novel"
+
+    def _safe_path(self, raw: str) -> Path:
+        """Chỉ cho đọc trong thư mục fixtures — URL demo là đường dẫn file,
+        không giới hạn thì dry-run/thêm truyện đọc được file bất kỳ."""
+        root = self.fixtures_dir.resolve()
+        path = Path(raw).resolve()
+        if path != root and not path.is_relative_to(root):
+            raise ScrapeError(f"[{self.key}] Đường dẫn ngoài thư mục fixtures bị từ chối: {raw}")
+        return path
 
     def list_genre_novels(self, genre_list_url: str, scan_window: int) -> list[NovelRef]:
         return self.list_genre_novels_page(genre_list_url, page=1)[:scan_window]
@@ -37,7 +47,7 @@ class DemoLocalSource:
         ]
 
     def list_chapters(self, novel_url: str) -> list[ChapterRef]:
-        novel_dir = Path(novel_url)
+        novel_dir = self._safe_path(novel_url)
         files = sorted(novel_dir.glob("chapter_*.txt"))
         if not files:
             raise ScrapeError(f"[{self.key}] Không tìm thấy file chương nào trong {novel_dir}")
@@ -54,7 +64,10 @@ class DemoLocalSource:
     def derive_novel_url(self, chapter_url: str) -> str | None:
         """Suy ra thư mục truyện từ đường dẫn file 1 chương — luôn suy ra
         được vì nguồn demo dùng thẳng đường dẫn file làm 'url'."""
-        path = Path(chapter_url)
+        try:
+            path = self._safe_path(chapter_url)
+        except ScrapeError:
+            return None
         if path.is_dir():
             return str(path)
         return str(path.parent)
@@ -66,7 +79,7 @@ class DemoLocalSource:
         return f"[Demo] {novel_dir.name}"
 
     def fetch_chapter_content(self, chapter_url: str) -> str:
-        path = Path(chapter_url)
-        if not path.exists():
+        path = self._safe_path(chapter_url)
+        if not path.is_file():
             raise ScrapeError(f"[{self.key}] File không tồn tại: {path}")
         return path.read_text(encoding="utf-8")

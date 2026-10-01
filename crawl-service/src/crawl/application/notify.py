@@ -1,7 +1,6 @@
 """Webhook thông báo (Discord / Telegram / generic JSON POST)."""
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 from urllib.parse import urlparse
@@ -21,10 +20,37 @@ def _looks_like_telegram(url: str) -> bool:
     return "api.telegram.org" in host
 
 
+def webhook_url_error(url: str) -> str | None:
+    """None nếu URL webhook dùng được: http(s), host không phải IP private/
+    loopback (trừ khi NOTIFY_ALLOW_PRIVATE_WEBHOOK=true). Rỗng = tắt, hợp lệ."""
+    url = (url or "").strip()
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        return "Webhook URL phải là http(s)://…"
+    try:
+        from platform_.config import config
+
+        allow_private = bool(config.notify_allow_private_webhook)
+    except Exception:
+        allow_private = False
+    if not allow_private:
+        from crawl.infrastructure.sources.fetch_guard import host_is_private
+
+        if host_is_private(parsed.hostname):
+            return "Webhook URL trỏ tới địa chỉ nội bộ/private — bật NOTIFY_ALLOW_PRIVATE_WEBHOOK nếu cố ý"
+    return None
+
+
 def send_webhook(url: str, *, title: str, body: str, extra: dict[str, Any] | None = None) -> bool:
     """Gửi thông báo. Trả True nếu HTTP 2xx. Nuốt lỗi mạng (không làm fail crawl)."""
     url = (url or "").strip()
     if not url:
+        return False
+    err = webhook_url_error(url)
+    if err:
+        logger.warning("Bỏ qua webhook: %s", err)
         return False
     payload: dict[str, Any]
     if _looks_like_discord(url):
@@ -61,3 +87,17 @@ def format_scan_summary(results: list[dict[str, Any]]) -> str:
             f"loại={item.get('rejected', 0)}, lỗi={item.get('errors', 0)}"
         )
     return "\n".join(lines)
+
+
+def notify_configured(db, *, title: str, body: str) -> bool:
+    """Gửi tới webhook trong setting `notify.webhook_url` (rỗng = tắt, không gửi)."""
+    try:
+        from platform_.settings_store import get_setting
+
+        url = (get_setting(db, "notify.webhook_url", "") or "").strip()
+    except Exception:
+        logger.exception("Không đọc được notify.webhook_url")
+        return False
+    if not url:
+        return False
+    return send_webhook(url, title=title, body=body)

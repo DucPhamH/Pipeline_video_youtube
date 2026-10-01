@@ -86,6 +86,8 @@ class SmoothNovelResult:
     success: bool
     chapters_smoothed: int = 0
     chapters_skipped: int = 0
+    # Số chương bị bỏ qua vì đã review/sửa tay (không có force) — nằm trong chapters_skipped.
+    chapters_protected: int = 0
     removed_lines: int = 0
     chapter_ids: list[int] = field(default_factory=list)
     error: str | None = None

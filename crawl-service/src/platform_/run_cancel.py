@@ -6,6 +6,11 @@ Redis/DB flag riêng.
 from __future__ import annotations
 
 import threading
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+
+from crawl.domain.ports import ScrapeError
 
 _guard = threading.Lock()
 _flags: dict[int, threading.Event] = {}
@@ -40,3 +45,45 @@ def is_cancelled(genre_id: int) -> bool:
     with _guard:
         ev = _flags.get(genre_id)
         return bool(ev is not None and ev.is_set())
+
+
+# --- Cờ dừng theo THREAD — tầng fetch (chờ Retry-After/backoff) kiểm tra
+# để không ngủ hàng phút sau khi người dùng đã bấm Dừng quét.
+_scope = threading.local()
+
+
+class CancelledDuringWait(ScrapeError):
+    """Đang chờ retry thì lượt quét bị hủy."""
+
+
+@contextmanager
+def cancel_scope(should_stop: Callable[[], bool] | None) -> Iterator[None]:
+    prev = getattr(_scope, "should_stop", None)
+    _scope.should_stop = should_stop
+    try:
+        yield
+    finally:
+        _scope.should_stop = prev
+
+
+def current_should_stop() -> bool:
+    fn = getattr(_scope, "should_stop", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
+def interruptible_sleep(seconds: float, *, step: float = 0.5) -> None:
+    """time.sleep chia nhỏ — raise CancelledDuringWait nếu cờ dừng của
+    thread hiện tại bật trong lúc chờ."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if current_should_stop():
+            raise CancelledDuringWait("Đã hủy trong lúc chờ thử lại")
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(step, left))

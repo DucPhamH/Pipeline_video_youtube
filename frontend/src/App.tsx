@@ -1,8 +1,10 @@
 import { Suspense, lazy } from "react"
-import { Navigate, Route, Routes } from "react-router-dom"
+import { Route, Routes } from "react-router-dom"
 import { Toaster } from "@/components/ui/sonner"
-import { useT } from "./i18n"
+import { ApiTokenPromptDialog } from "@/components/ApiTokenPrompt"
 import { AppLayout } from "./layout/AppLayout"
+import { PageSkeleton } from "@/components/Skeleton"
+import { PlayerProvider } from "@/features/player/PlayerProvider"
 
 const SitesPage = lazy(() =>
   import("./features/crawl/pages/SitesPage").then((m) => ({ default: m.SitesPage })),
@@ -39,22 +41,55 @@ const TranslateJobPage = lazy(() =>
     default: m.TranslateJobPage,
   })),
 )
+const WriteStoriesPage = lazy(() =>
+  import("./features/write/pages/WriteStoriesPage").then((m) => ({ default: m.WriteStoriesPage })),
+)
+const WriteStoryPage = lazy(() =>
+  import("./features/write/pages/WriteStoryPage").then((m) => ({ default: m.WriteStoryPage })),
+)
+const HomePage = lazy(() =>
+  import("./features/home/HomePage").then((m) => ({ default: m.HomePage })),
+)
+const ReaderPage = lazy(() =>
+  import("./features/reader/ReaderPage").then((m) => ({ default: m.ReaderPage })),
+)
+const TtsWorksPage = lazy(() =>
+  import("./features/tts/pages/TtsWorksPage").then((m) => ({ default: m.TtsWorksPage })),
+)
+const TtsWorkPage = lazy(() =>
+  import("./features/tts/pages/TtsWorkPage").then((m) => ({ default: m.TtsWorkPage })),
+)
 
 function PageFallback() {
-  const t = useT()
-  return <p className="text-sm text-muted-foreground">{t("app.loadingPage")}</p>
+  return <PageSkeleton />
 }
 
 export default function App() {
   return (
-    <>
+    <PlayerProvider>
       <Routes>
         <Route element={<AppLayout />}>
           <Route
             index
             element={
               <Suspense fallback={<PageFallback />}>
-                <Navigate to="/sites" replace />
+                <HomePage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="read/translate/:workId/:jobId"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <ReaderPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="read/write/:storyId"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <ReaderPage />
               </Suspense>
             }
           />
@@ -122,6 +157,38 @@ export default function App() {
               </Suspense>
             }
           />
+          <Route
+            path="write"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <WriteStoriesPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="write/:storyId"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <WriteStoryPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="tts"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <TtsWorksPage />
+              </Suspense>
+            }
+          />
+          <Route
+            path="tts/:workId"
+            element={
+              <Suspense fallback={<PageFallback />}>
+                <TtsWorkPage />
+              </Suspense>
+            }
+          />
           {/* Sửa 17/9/2026: route tự nó phải gate theo DEV giống link nav
               (AppLayout.tsx) — trước đây chỉ ẩn link, route vẫn truy cập
               được ở bản build production nếu biết/đoán URL. */}
@@ -137,7 +204,8 @@ export default function App() {
           )}
         </Route>
       </Routes>
+      <ApiTokenPromptDialog />
       <Toaster position="top-right" richColors />
-    </>
+    </PlayerProvider>
   )
 }

@@ -1,14 +1,16 @@
 # Crawl Service — thiết kế chức năng (đọc nhanh)
 
-> **Dành cho AI / người mới vào repo:** đọc file này **trước**.  
+> Sản phẩm tên **Folio** (cào → dịch → đọc). File này chỉ mô tả service cào.
+>
+> **Dành cho AI / người mới vào repo:** đọc file này **trước** khi sửa crawl.  
 > Spec sâu / lịch sử quyết định dài: [crawl-service.md](./crawl-service.md).  
 > Bản đồ thư mục code: [project-structure.md](./project-structure.md).  
 > Schema DB: [database-schema.md](./database-schema.md).  
 > API: [api-reference.md](./api-reference.md).  
 > Service kế tiếp (dịch): [translate-service.md](./translate-service.md).
 >
-> **Phạm vi:** CHỈ `crawl-service` + FE crawl. Dịch nằm ở `translate-service`
-> (đã code). TTS/video không có trong repo.
+> **Phạm vi file này:** CHỈ `crawl-service` + FE crawl. Dịch nằm ở
+> `translate-service`. Đọc nằm ở `tts-service`. Video chưa có.
 
 **Trạng thái:** crawl đã ship. Handoff sang translate đã nối. Cập nhật: 2026-09-25.
 
