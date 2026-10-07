@@ -18,6 +18,13 @@ services:
       FOLIO_API_TOKEN: ${FOLIO_API_TOKEN:-}
     volumes:
       - crawl_data:/app/data
+    # DNS nhà mạng VN trả 127.0.0.1 cho nhiều site truyện VN (chặn DNS).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    # dns tuỳ chỉnh làm mất host.docker.internal mặc định của Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   frontend:

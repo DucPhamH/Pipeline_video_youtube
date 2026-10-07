@@ -84,6 +84,38 @@ def test_ui_region_overrides_env(monkeypatch):
     assert get_a_proxy(source_key="truyenfull_vn") == "http://ui-vn:7890"
 
 
+def test_socks5_transport_resolves_dns_locally(monkeypatch):
+    import socket
+
+    import httpx
+
+    from crawl.infrastructure.sources.proxy_pool import LocalDnsSocksTransport
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, port, *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("104.21.52.100", port))],
+    )
+    seen = {}
+
+    def fake_handle(self, request):
+        seen["url"] = str(request.url)
+        seen["host_header"] = request.headers["host"]
+        seen["sni"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200, request=request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", fake_handle)
+    transport = LocalDnsSocksTransport(proxy="socks5://127.0.0.1:40000")
+    with httpx.Client(transport=transport) as client:
+        resp = client.get("https://docln.net/the-loai/fantasy")
+
+    assert resp.status_code == 200
+    assert seen["url"] == "https://104.21.52.100/the-loai/fantasy"
+    assert seen["host_header"] == "docln.net"
+    assert seen["sni"] == "docln.net"
+    assert str(resp.request.url) == "https://docln.net/the-loai/fantasy"
+
+
 def test_playwright_proxy_auth():
     cfg = playwright_proxy_config("socks5://user%40x:p%40ss@127.0.0.1:1080")
     assert cfg["server"] == "socks5://127.0.0.1:1080"

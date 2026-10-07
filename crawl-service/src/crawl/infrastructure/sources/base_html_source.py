@@ -31,7 +31,11 @@ from crawl.infrastructure.sources.fetch_guard import (
     assert_public_url,
     url_belongs_to_source,
 )
-from crawl.infrastructure.sources.proxy_pool import get_a_proxy, httpx_proxy_mounts
+from crawl.infrastructure.sources.proxy_pool import (
+    LocalDnsSocksTransport,
+    get_a_proxy,
+    httpx_proxy_mounts,
+)
 from crawl.infrastructure.sources.text_decode import charset_from_content_type, decode_html_bytes
 from crawl.infrastructure.sources.tls_fetch import looks_like_cloudflare_challenge
 
@@ -198,6 +202,8 @@ class BaseHtmlSource:
         }
         if not proxy:
             return httpx.Client(**kwargs)
+        if proxy.startswith("socks5://"):
+            return httpx.Client(transport=LocalDnsSocksTransport(proxy=proxy), **kwargs)
         # httpx: ưu tiên `proxy=` (0.28+); 0.27 vẫn nhận `proxies=`.
         try:
             return httpx.Client(proxy=httpx_proxy_mounts(proxy), **kwargs)

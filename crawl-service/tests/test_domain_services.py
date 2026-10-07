@@ -67,6 +67,18 @@ def test_validate_accepts_real_chinese_text():
     assert reason is None
 
 
+def test_validate_accepts_real_english_text():
+    text = "The young knight walked along the mountain path, feeling unusually cheerful. " * 5
+    ok, reason = validate_chapter_content(text, locale="en")
+    assert ok, reason
+
+
+def test_validate_rejects_chinese_text_for_en_locale():
+    text = "今天天气很好，少年走在山间小道上，心情格外愉快。" * 5
+    ok, _ = validate_chapter_content(text, locale="en")
+    assert not ok
+
+
 def test_is_completed_detects_markers():
     assert is_completed("第一百章 大结局")
     assert is_completed("尾声")

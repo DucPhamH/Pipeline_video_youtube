@@ -34,6 +34,12 @@ _SITE_ACCESS: dict[str, SiteAccessKind] = {
     "ixdzs_tw": "free",
     "ttkan_co": "free",
     "quanben_io": "free",
+    "truyendichfull_site": "free",
+    "royalroad_com": "free",
+    "novema_jp": "free",
+    "sfacg_com": "session_optional",
+    "fanqie_com": "session_optional",
+    "qdmm_com": "session_required",
 }
 
 

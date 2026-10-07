@@ -22,7 +22,7 @@ import { Skeleton } from "@/components/Skeleton"
 
 const PAGE_SIZE = 12
 
-const REGION_VALUES: SiteRegionFilter[] = ["all", "china", "japan", "korea", "vietnam", "taiwan"]
+const REGION_VALUES: SiteRegionFilter[] = ["all", "china", "japan", "korea", "vietnam", "taiwan", "english"]
 const ACCESS_VALUES: SiteAccessFilter[] = [
   "all",
   "free",

@@ -31,7 +31,7 @@ def test_list_sites_excludes_test_only_sources(client):
     for s in sites:
         assert set(s.keys()) == {"key", "name", "access_kind", "region"}
         assert s["access_kind"] in {"free", "session_optional", "session_required"}
-        assert s["region"] in {"china", "japan", "korea", "vietnam", "taiwan"}
+        assert s["region"] in {"china", "japan", "korea", "vietnam", "taiwan", "english"}
     assert "syosetu_com" in keys
     assert "kakuyomu_com" in keys
     assert "novelba_com" in keys
@@ -48,7 +48,12 @@ def test_list_sites_excludes_test_only_sources(client):
     assert "syosetu_com" in keys
     assert "jjwxc_net" in keys
     assert "zongheng_com" in keys
-
+    assert "truyendichfull_site" in keys
+    assert "royalroad_com" in keys
+    assert "novema_jp" in keys
+    assert "sfacg_com" in keys
+    assert "fanqie_com" in keys
+    assert "qdmm_com" in keys
 
 def test_list_sites_filters_by_access_kind(client):
     free = client.get("/api/crawl/sites", params={"access_kind": "free", "limit": 100}).json()
@@ -78,6 +83,7 @@ def test_list_sites_filters_by_region(client):
     assert "novelba_com" in {s["key"] for s in japan["items"]}
     assert "daysneo_com" in {s["key"] for s in japan["items"]}
     assert "linovelib_com" in {s["key"] for s in japan["items"]}
+    assert "novema_jp" in {s["key"] for s in japan["items"]}
 
     taiwan = client.get("/api/crawl/sites", params={"region": "taiwan", "limit": 100}).json()
     assert taiwan["total"] >= 4
@@ -97,11 +103,18 @@ def test_list_sites_filters_by_region(client):
         "dtruyen_com",
         "sstruyen_net",
         "docln_net",
+        "truyendichfull_site",
     }
+
+    english = client.get("/api/crawl/sites", params={"region": "english", "limit": 100}).json()
+    assert english["total"] >= 1
+    assert all(s["region"] == "english" for s in english["items"])
+    assert "royalroad_com" in {s["key"] for s in english["items"]}
 
     china = client.get("/api/crawl/sites", params={"region": "china", "limit": 100}).json()
     assert china["total"] >= 15
     assert "bqgxs_com" in {s["key"] for s in china["items"]}
+    assert {"fanqie_com", "sfacg_com", "qdmm_com"} <= {s["key"] for s in china["items"]}
 
 
 def test_list_sites_paginates_and_searches(client):

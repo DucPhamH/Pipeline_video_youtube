@@ -158,6 +158,8 @@ def _script_ratio(text: str, locale: str) -> float:
         if latin == 0:
             return 0.0
         return len(_VIETNAMESE_CHAR_RE.findall(text)) / latin
+    if locale == "en":
+        return sum(1 for c in text if c.isascii() and c.isalpha()) / len(text)
     return len(_CHINESE_CHAR_RE.findall(text)) / len(text)
 
 
@@ -175,7 +177,7 @@ def validate_chapter_content(text: str, *, locale: str = "zh") -> tuple[bool, st
     ratio = _script_ratio(text, locale)
     min_ratio = MIN_CHINESE_RATIO if locale == "zh" else MIN_SCRIPT_RATIO
     if ratio < min_ratio:
-        label = {"zh": "Hán", "ja": "Nhật", "ko": "Hàn", "vi": "Việt"}.get(locale, locale)
+        label = {"zh": "Hán", "ja": "Nhật", "ko": "Hàn", "vi": "Việt", "en": "Anh"}.get(locale, locale)
         return False, f"Tỉ lệ ký tự {label} quá thấp ({ratio:.0%}) — nội dung có thể không đúng"
 
     return True, None

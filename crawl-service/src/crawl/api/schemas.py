@@ -18,8 +18,8 @@ class SiteOut(BaseModel):
     name: str
     # free | session_optional | session_required — xem site_access.py
     access_kind: Literal["free", "session_optional", "session_required"]
-    # china | japan | korea | vietnam | taiwan — xem site_regions.py
-    region: Literal["china", "japan", "korea", "vietnam", "taiwan"]
+    # china | japan | korea | vietnam | taiwan | english — xem site_regions.py
+    region: Literal["china", "japan", "korea", "vietnam", "taiwan", "english"]
 
 
 class SiteListOut(BaseModel):

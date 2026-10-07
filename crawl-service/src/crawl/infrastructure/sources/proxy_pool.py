@@ -11,10 +11,14 @@ URL hợp lệ: `http://…`, `https://…`, `socks5://…`, `socks5h://…` (DN
 """
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import threading
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+import httpx
 
 from crawl.infrastructure.sources.site_regions import site_region
 
@@ -195,6 +199,32 @@ def httpx_proxy_mounts(proxy_url: str) -> str:
     if proxy_url.startswith("socks5h://"):
         return "socks5://" + proxy_url.removeprefix("socks5h://")
     return proxy_url
+
+
+class LocalDnsSocksTransport(httpx.HTTPTransport):
+    """`socks5://` = DNS tại chỗ (quy ước curl). httpcore luôn gửi tên miền
+    cho proxy SOCKS, nên tự resolve rồi gửi IP; SNI/Host vẫn là tên miền.
+    Cần khi DNS phía proxy bị nhà mạng chặn (vd WARP trên máy VN)."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        try:
+            ipaddress.ip_address(host)
+            return super().handle_request(request)
+        except ValueError:
+            pass
+        port = request.url.port or (443 if request.url.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        ip = next((i[4][0] for i in infos if i[0] == socket.AF_INET), infos[0][4][0])
+        extensions = {**request.extensions, "sni_hostname": host}
+        resolved = httpx.Request(
+            request.method,
+            request.url.copy_with(host=ip),
+            headers=request.headers,
+            stream=request.stream,
+            extensions=extensions,
+        )
+        return super().handle_request(resolved)
 
 
 def playwright_proxy_config(proxy_url: str) -> dict[str, str]:

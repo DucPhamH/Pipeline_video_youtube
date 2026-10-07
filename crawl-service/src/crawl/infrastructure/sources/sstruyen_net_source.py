@@ -20,15 +20,18 @@ class SstruyenNetSource(BaseHtmlSource):
                 base_url="https://sstruyen.net",
                 content_locale="vi",
                 accept_language="vi,en;q=0.8",
-                genre_item_selector=".list-truyen .row, .list-item, .cate-list-books .list-item",
-                genre_title_selector="h3.truyen-title a, .truyen-title a, .series-title a",
-                chapter_list_selector=".light-off-list ul.list-chapter li a, ul.list-chapter li a",
+                genre_item_selector="article.archive-story-card",
+                genre_title_selector=".archive-story-card__title a",
+                genre_latest_chapter_selector=".archive-story-card__chapter a",
+                # #new-chapter (4 chương mới nhất) cũng là ul.list-chapter — chỉ lấy mục lục.
+                chapter_list_selector="#list-chapter ul.list-chapter li a",
                 content_selector=".chapter-content, #chapter-c",
                 novel_title_selector="h3.title, h1.title",
                 novel_author_selector='[itemprop="author"]',
                 novel_cover_selector='[itemprop="image"]',
                 strip_lines_containing=["sstruyen", "quảng cáo", "bình luận"],
-                request_delay_sec=1.0,
+                # 1s/request dính HTTP 429 sau ~10 trang; ~2s thì ổn.
+                request_delay_sec=2.0,
                 paginate_list_url=self._paginate_list_url,
                 novel_url_from_chapter=self._derive_novel_url,
             )
