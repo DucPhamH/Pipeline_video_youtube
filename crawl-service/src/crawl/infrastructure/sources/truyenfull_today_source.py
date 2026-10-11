@@ -10,4 +10,5 @@ class TruyenfullTodaySource(TruyenfullFamilySource):
             key="truyenfull_today",
             name="TruyenFull.today (VN · cần proxy)",
             base_url="https://truyenfull.today",
+            mirror_hosts=["truyenfull.live"],
         )

@@ -64,7 +64,47 @@ def _resolve(host: str) -> list[str]:
     return addrs
 
 
-def host_is_private(host: str) -> bool:
+_DOH_URL = "https://1.1.1.1/dns-query"
+
+
+def _resolve_doh(host: str) -> list[str]:
+    import httpx
+
+    try:
+        resp = httpx.get(
+            _DOH_URL,
+            params={"name": host, "type": "A"},
+            headers={"accept": "application/dns-json"},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        answers = resp.json().get("Answer") or []
+        return sorted({a["data"] for a in answers if a.get("type") == 1})
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return []
+
+
+def resolve_for_local_dns_proxy(host: str) -> list[str]:
+    """IP gửi cho proxy `socks5://` (DNS tại chỗ). DNS nhà mạng có thể trả
+    127.0.0.1 cho site bị chặn → tra lại qua DoH 1.1.1.1. Guard và transport
+    phải dùng chung hàm này để IP được kiểm tra = IP được kết nối."""
+    addrs = _resolve(host)
+    public = [a for a in addrs if not is_private_ip(a)]
+    if public:
+        return public
+    now = time.monotonic()
+    key = "doh:" + host
+    with _dns_lock:
+        hit = _dns_cache.get(key)
+        if hit is not None and now - hit[0] < _DNS_TTL_SEC:
+            return hit[1] or addrs
+    doh = [a for a in _resolve_doh(host) if not is_private_ip(a)]
+    with _dns_lock:
+        _dns_cache[key] = (now, doh)
+    return doh or addrs
+
+
+def host_is_private(host: str, *, resolve: bool = True, resolver=None) -> bool:
     host = (host or "").strip("[]").lower()
     if not host:
         return True
@@ -73,17 +113,30 @@ def host_is_private(host: str) -> bool:
     try:
         ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
-        return any(is_private_ip(a) for a in _resolve(host))
+        return resolve and any(is_private_ip(a) for a in (resolver or _resolve)(host))
     return is_private_ip(host)
 
 
-def assert_public_url(url: str, *, allow_private: bool | None = None) -> None:
+def proxy_resolves_dns(proxy: str | None) -> bool:
+    """Proxy http(s)/socks5h/socks4a tự resolve tên miền — DNS tại máy (có thể
+    bị nhà mạng trả 127.0.0.1) không quyết định IP được kết nối."""
+    if not proxy:
+        return False
+    return urlsplit(proxy).scheme.lower() in ("http", "https", "socks5h", "socks4a")
+
+
+def assert_public_url(
+    url: str, *, allow_private: bool | None = None, proxy: str | None = None
+) -> None:
     parts = urlsplit((url or "").strip())
     if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         raise BlockedUrlError(f"URL không hợp lệ (chỉ nhận http/https): {url}")
     if allow_private is None:
         allow_private = _private_fetch_allowed()
-    if not allow_private and host_is_private(parts.hostname):
+    resolve = not proxy_resolves_dns(proxy)
+    local_dns_proxy = bool(proxy) and urlsplit(proxy).scheme.lower() == "socks5"
+    resolver = resolve_for_local_dns_proxy if local_dns_proxy else _resolve
+    if not allow_private and host_is_private(parts.hostname, resolve=resolve, resolver=resolver):
         raise BlockedUrlError(f"Chặn fetch tới địa chỉ nội bộ/private: {parts.hostname}")
 
 

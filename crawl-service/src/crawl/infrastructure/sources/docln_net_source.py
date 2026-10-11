@@ -1,12 +1,42 @@
 """Adapter docln.net / hako — light novel dịch VN; thường cần CRAWL_PROXY_VN.
 
 Selectors theo lncrawl `sources/vi/lnhakone.py`. Chương có thể cần login.
+Nội dung chương nằm mã hoá trong `#chapter-c-protected` — xem `decode_protected`.
 """
+import base64
+import binascii
+import json
 import re
+
+from bs4 import BeautifulSoup
 
 from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef
 from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
+
+
+def decode_protected(node) -> str | None:
+    """Giải `#chapter-c-protected` (theo app.js của docln): `data-c` là JSON list
+    chunk "NNNN" + base64, ghép theo NNNN; `data-s` = xor_shuffle (XOR byte với
+    `data-k`) | base64_reverse (đảo chuỗi trước khi giải base64) | khác = base64."""
+    scheme = node.get("data-s") or "none"
+    key = (node.get("data-k") or "").encode()
+    try:
+        chunks = json.loads(node.get("data-c") or "[]")
+        if not isinstance(chunks, list) or not chunks:
+            return None
+        parts = []
+        for chunk in sorted(chunks, key=lambda c: int(c[:4])):
+            body = chunk[4:]
+            if scheme == "base64_reverse":
+                body = body[::-1]
+            raw = base64.b64decode(body)
+            if scheme == "xor_shuffle" and key:
+                raw = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+            parts.append(raw.decode("utf-8", errors="replace"))
+    except (ValueError, TypeError, binascii.Error):
+        return None
+    return "".join(parts)
 
 
 class DoclnNetSource(BaseHtmlSource):
@@ -78,6 +108,15 @@ class DoclnNetSource(BaseHtmlSource):
                 f"[{self.key}] Thiếu #chapter-content tại {chapter_url} — "
                 "chương khoá / cần đăng nhập."
             )
+        protected = node.select_one("#chapter-c-protected")
+        if protected is not None:
+            decoded = decode_protected(protected)
+            if decoded is None:
+                raise ScrapeError(
+                    f"[{self.key}] Không giải mã được #chapter-c-protected tại {chapter_url} "
+                    "— docln có thể đã đổi thuật toán (app.js)."
+                )
+            protected.replace_with(BeautifulSoup(decoded, "html.parser"))
         paras = [
             p.get_text("\n", strip=True)
             for p in node.select("p")

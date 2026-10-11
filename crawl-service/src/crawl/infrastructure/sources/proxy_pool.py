@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import socket
 import threading
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -213,9 +212,12 @@ class LocalDnsSocksTransport(httpx.HTTPTransport):
             return super().handle_request(request)
         except ValueError:
             pass
-        port = request.url.port or (443 if request.url.scheme == "https" else 80)
-        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        ip = next((i[4][0] for i in infos if i[0] == socket.AF_INET), infos[0][4][0])
+        from crawl.infrastructure.sources.fetch_guard import resolve_for_local_dns_proxy
+
+        addrs = resolve_for_local_dns_proxy(host)
+        if not addrs:
+            raise httpx.ConnectError(f"Không resolve được {host}", request=request)
+        ip = next((a for a in addrs if ":" not in a), addrs[0])
         extensions = {**request.extensions, "sni_hostname": host}
         resolved = httpx.Request(
             request.method,

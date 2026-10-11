@@ -3,10 +3,12 @@ import re
 
 from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef, NovelRef
-from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
+from crawl.infrastructure.sources.base_browser_source import BaseBrowserSource
+from crawl.infrastructure.sources.base_html_source import SourceConfig
 
 
-class TrxsCcSource(BaseHtmlSource):
+class TrxsCcSource(BaseBrowserSource):
+    # httpx thuần bị 403; TLS impersonate qua được.
     def __init__(self) -> None:
         super().__init__(
             SourceConfig(

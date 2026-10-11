@@ -5,13 +5,15 @@ import re
 
 from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef, NovelRef
-from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
+from crawl.infrastructure.sources.base_browser_source import BaseBrowserSource
+from crawl.infrastructure.sources.base_html_source import SourceConfig
 
 _FICTION = re.compile(r"/fiction/(\d+)(?:/[^/]*)?/?$", re.I)
 _CHAPTER = re.compile(r"/fiction/(\d+)/[^/]+/chapter/(\d+)", re.I)
 
 
-class RoyalroadComSource(BaseHtmlSource):
+class RoyalroadComSource(BaseBrowserSource):
+    # httpx thuần bị 403; TLS impersonate qua được.
     def __init__(self) -> None:
         super().__init__(
             SourceConfig(

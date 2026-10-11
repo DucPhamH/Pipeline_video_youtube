@@ -12,7 +12,7 @@ SiteAccessKind = Literal["free", "session_optional", "session_required"]
 _SITE_ACCESS: dict[str, SiteAccessKind] = {
     "qidian_com": "session_required",
     "wenku8_net": "session_required",
-    "ciweimao_com": "session_optional",
+    "ciweimao_com": "session_required",
     "faloo_com": "session_optional",
     "n17k_com": "session_optional",
     "syosetu_com": "free",

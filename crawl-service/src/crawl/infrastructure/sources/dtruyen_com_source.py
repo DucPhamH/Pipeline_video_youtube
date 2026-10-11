@@ -33,6 +33,7 @@ class DtruyenComSource(BaseHtmlSource):
                 strip_lines_containing=["dtruyen", "truyencom", "quảng cáo", "bình luận"],
                 request_delay_sec=1.0,
                 paginate_list_url=self._paginate_list_url,
+                mirror_hosts=["wetruyen.com", "dtruyen.com"],
             )
         )
 

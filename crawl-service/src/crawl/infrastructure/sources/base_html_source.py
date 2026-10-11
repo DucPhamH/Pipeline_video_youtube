@@ -189,7 +189,7 @@ class BaseHtmlSource:
         """Event hook httpx — chạy cho MỌI request kể cả từng bước redirect:
         chặn host private (SSRF) và bỏ Cookie phiên nếu host không thuộc site."""
         url = str(request.url)
-        assert_public_url(url)
+        assert_public_url(url, proxy=self._proxy_url)
         if "cookie" in request.headers and not url_belongs_to_source(url, self):
             del request.headers["cookie"]
 
@@ -281,7 +281,7 @@ class BaseHtmlSource:
         (không kiểm marker VIP — dễ false positive)."""
         from platform_.run_cancel import interruptible_sleep
 
-        assert_public_url(url)
+        assert_public_url(url, proxy=self._proxy_url)
         self._apply_user_session()
         retry_after_budget = {"left": _MAX_TOTAL_RETRY_AFTER_SEC}
 

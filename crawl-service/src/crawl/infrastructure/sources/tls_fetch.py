@@ -28,7 +28,11 @@ def tls_get(
     Chặn URL private (SSRF); cookie chỉ gửi khi host thuộc site `source_key`."""
     from crawl.infrastructure.sources.fetch_guard import assert_public_url, cookie_allowed_for
 
-    assert_public_url(url)
+    if proxy is None:
+        from crawl.infrastructure.sources.proxy_pool import get_a_proxy
+
+        proxy = get_a_proxy(source_key=source_key)
+    assert_public_url(url, proxy=proxy)
     if cookie_header and not cookie_allowed_for(url, source_key):
         cookie_header = ""
     try:
@@ -47,11 +51,6 @@ def tls_get(
         headers["Referer"] = referer
     if cookie_header:
         headers["Cookie"] = cookie_header
-
-    if proxy is None:
-        from crawl.infrastructure.sources.proxy_pool import get_a_proxy
-
-        proxy = get_a_proxy(source_key=source_key)
 
     try:
         kwargs: dict = {

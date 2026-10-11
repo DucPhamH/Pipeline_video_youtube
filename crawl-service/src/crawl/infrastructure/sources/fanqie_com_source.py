@@ -1,7 +1,7 @@
 """Adapter fanqienovel.com (番茄小说) — list/TOC qua API công khai.
 
-Nội dung reader dùng font obfuscation (PUA) — v1 lấy text từ
-`.muye-reader-content` (có thể còn ký tự lạ); VIP/API full thường rỗng.
+Nội dung reader dùng font obfuscation (PUA) — text `.muye-reader-content` được
+giải bằng bảng `_PUA_CHARSET` (`decode_pua`); VIP/API full thường rỗng.
 """
 from __future__ import annotations
 
@@ -18,6 +18,24 @@ from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, Source
 
 _BOOK_ID = re.compile(r"(?:/page/|bookId=|book_id=)(\d{10,})")
 _ITEM_ID = re.compile(r"/reader/(\d{10,})")
+
+# Font reader (bytetos awesome-font/c/dc027189e0ba4cd): mã PUA U+E3E8+i vẽ ra
+# glyph của _PUA_CHARSET[i]. "?" = mã không có glyph trong font — giữ nguyên.
+# Đã đối chiếu từng glyph của font với bảng này (7/10/2026).
+_PUA_START = 0xE3E8
+_PUA_CHARSET = (
+    "D在主特家军然表场4要只v和?6别还g现儿岁??此象月3出战工相o男直失世F都平文什VO将真T那当?会立些u是十张学气大爱两"
+    "命全后东性通被1它乐接而感车山公了常以何可话先pi叫轻M士w着变尔快l个说少色里安花远7难师放t报认面道S?克地度I好机U民"
+    "写把万同水新没书电吃像斯5为y白几日教看但第加候作上拉住有法r事应位利你声身国问马女他Y比父xAHNsX边美对所金活回意到z"
+    "从j知又内因点Q三定8Rb正或夫向德听更?得告并本q过记L让打f人就者去原满体做经K走如孩cG给使物?最笑部?员等受k行一条"
+    "果动光门头见往自解成处天能于名其发总母的死手入路进心来h时力多开已许d至由很界n小与Z想代么分生口再妈望次西风种带J?实情才"
+    "这?E我神格长觉间年眼无不亲关结0友信下却重己老2音字m呢明之前高PB目太e9起稜她也W用方子英每理便四数期中C外样a海们任"
+)
+_PUA_TABLE = {_PUA_START + i: c for i, c in enumerate(_PUA_CHARSET) if c != "?"}
+
+
+def decode_pua(text: str) -> str:
+    return text.translate(_PUA_TABLE)
 
 
 class FanqieComSource(BaseHtmlSource):
@@ -113,8 +131,7 @@ class FanqieComSource(BaseHtmlSource):
             bid = str(b.get("book_id") or "")
             if not bid:
                 continue
-            title = str(b.get("book_name") or "").strip() or f"book-{bid}"
-            # tên API có thể bị font-obfuscate — vẫn giữ book_id trong URL
+            title = decode_pua(str(b.get("book_name") or "").strip()) or f"book-{bid}"
             results.append(
                 NovelRef(
                     title=title,
@@ -155,7 +172,7 @@ class FanqieComSource(BaseHtmlSource):
             for ch in vol if isinstance(vol, list) else (vol.get("chapterList") or vol.get("chapter_list") or []):
                 if isinstance(ch, dict):
                     iid = str(ch.get("itemId") or ch.get("item_id") or ch.get("id") or "")
-                    t = str(ch.get("title") or ch.get("chapter_name") or "").strip()
+                    t = decode_pua(str(ch.get("title") or ch.get("chapter_name") or "").strip())
                     if iid and t:
                         titles[iid] = t
 
@@ -198,13 +215,13 @@ class FanqieComSource(BaseHtmlSource):
                 f"[{self.key}] Thiếu reader content tại {chapter_url} "
                 "(có thể bị chặn / cần cookie)."
             )
-        text = node.get_text("\n", strip=True)
-        # đếm PUA — cảnh báo nếu gần như toàn obfuscation
+        text = decode_pua(node.get_text("\n", strip=True))
+        # PUA còn sót nhiều sau giải mã = site đã đổi font/bảng mã.
         pua = sum(1 for ch in text if 0xE000 <= ord(ch) <= 0xF8FF)
         if pua > max(40, len(text) // 3):
             raise ScrapeError(
                 f"[{self.key}] Nội dung bị font-obfuscation tại {chapter_url} — "
-                "cần map font / cập nhật adapter sau."
+                "font có thể đã đổi, cần cập nhật _PUA_CHARSET."
             )
         if len(text) < 40:
             raise ScrapeError(f"[{self.key}] Nội dung quá ngắn tại {chapter_url}")

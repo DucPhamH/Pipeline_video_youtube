@@ -62,7 +62,7 @@ class CiweimaoComSource(BaseHtmlSource):
             headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
         if cookie and url_belongs_to_source(url, self):
             headers["Cookie"] = cookie
-        assert_public_url(url)
+        assert_public_url(url, proxy=getattr(self, "_proxy_url", None) or None)
 
         try:
             from curl_cffi import requests as crequests
