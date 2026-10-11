@@ -10,6 +10,7 @@ from crawl.infrastructure.sources.base_html_source import SourceConfig
 
 _FICTION = re.compile(r"/fiction/(\d+)(?:/[^/]*)?/?$", re.I)
 _CHAPTER = re.compile(r"/fiction/(\d+)/[^/]+/chapter/(\d+)", re.I)
+_STATUSES = {"COMPLETED", "ONGOING", "HIATUS", "INACTIVE", "STUB", "DROPPED"}
 
 
 class RoyalroadComSource(BaseBrowserSource):
@@ -65,6 +66,8 @@ class RoyalroadComSource(BaseBrowserSource):
         else:
             return []
         soup = self._get_soup(url)
+        # Trang /fictions/complete bỏ nhãn trạng thái vì mọi truyện đều đã xong.
+        default_status = "COMPLETED" if "/fictions/complete" in url else ""
         results: list[NovelRef] = []
         seen: set[str] = set()
         for a in soup.select("h2.fiction-title a, .fiction-title a"):
@@ -79,10 +82,29 @@ class RoyalroadComSource(BaseBrowserSource):
             if abs_url in seen:
                 continue
             seen.add(abs_url)
-            results.append(NovelRef(title=title, url=abs_url, latest_chapter_title=""))
+            results.append(
+                NovelRef(
+                    title=title,
+                    url=abs_url,
+                    latest_chapter_title=self._listing_status(a) or default_status,
+                )
+            )
         if not results and page == 1:
             raise ScrapeError(f"[{self.key}] Không parse được fiction tại {url}")
         return results
+
+    @staticmethod
+    def _listing_status(title_link) -> str:
+        """Nhãn trạng thái (COMPLETED/ONGOING/…) của item trên listing — RR không
+        hiện chương mới nhất; domain lọc hoàn thành đọc nhãn này."""
+        item = title_link.find_parent(class_="fiction-list-item")
+        if item is None:
+            return ""
+        for label in item.select("span.label"):
+            text = label.get_text(strip=True).upper()
+            if text in _STATUSES:
+                return text
+        return ""
 
     def list_chapters(self, novel_url: str) -> list[ChapterRef]:
         soup = self._get_soup(novel_url)

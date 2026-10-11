@@ -114,10 +114,17 @@ def _try_fetch_novel_meta(source: SourcePort, novel_url: str) -> tuple[str, str]
     return author, cover
 
 
-def is_completed_for_novel(chapters: list[ChapterRef], locale: str) -> bool:
+def is_completed_for_novel(
+    chapters: list[ChapterRef], locale: str, listing_hint: str = ""
+) -> bool:
     if not chapters:
         return False
-    return is_completed(chapters[-1].title, locale=locale, total_chapters=len(chapters))
+    return is_completed(
+        chapters[-1].title,
+        locale=locale,
+        total_chapters=len(chapters),
+        listing_hint=listing_hint,
+    )
 
 
 def _skip_chapter_and_maybe_stop(
@@ -981,6 +988,7 @@ class CrawlGenreUseCase:
                     max_chapters_per_story,
                     completion_filter,
                     locale=locale,
+                    listing_hint=candidate.latest_chapter_title,
                 )
 
                 if accepted:
@@ -996,7 +1004,8 @@ class CrawlGenreUseCase:
                 novel = Novel(
                     id=None, title=candidate.title, source_key=genre.source_key, source_url=candidate.url,
                     genre_id=genre.id, total_chapters=len(chapters),
-                    is_complete=bool(chapters) and is_completed_for_novel(chapters, locale),
+                    is_complete=bool(chapters)
+                    and is_completed_for_novel(chapters, locale, candidate.latest_chapter_title),
                     author=author, cover_url=cover_url,
                 )
                 if not accepted:
