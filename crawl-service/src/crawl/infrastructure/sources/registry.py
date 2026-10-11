@@ -54,6 +54,12 @@ from crawl.infrastructure.sources.alphapolis_co_jp_source import AlphapolisCoJpS
 from crawl.infrastructure.sources.munpia_com_source import MunpiaComSource
 from crawl.infrastructure.sources.blqiuge_cc_source import BlqiugeCcSource
 from crawl.infrastructure.sources.pixiv_net_source import PixivNetSource
+from crawl.infrastructure.sources.truyendichfull_site_source import TruyendichfullSiteSource
+from crawl.infrastructure.sources.royalroad_com_source import RoyalroadComSource
+from crawl.infrastructure.sources.novema_jp_source import NovemaJpSource
+from crawl.infrastructure.sources.sfacg_com_source import SfacgComSource
+from crawl.infrastructure.sources.fanqie_com_source import FanqieComSource
+from crawl.infrastructure.sources.qdmm_com_source import QdmmComSource
 from platform_.config import config
 
 _bqgxs_com = BqgxsComSource()
@@ -100,6 +106,12 @@ _alphapolis_co_jp = AlphapolisCoJpSource()
 _munpia_com = MunpiaComSource()
 _blqiuge_cc = BlqiugeCcSource()
 _pixiv_net = PixivNetSource()
+_truyendichfull_site = TruyendichfullSiteSource()
+_royalroad_com = RoyalroadComSource()
+_novema_jp = NovemaJpSource()
+_sfacg_com = SfacgComSource()
+_fanqie_com = FanqieComSource()
+_qdmm_com = QdmmComSource()
 _demo_local = DemoLocalSource(fixtures_dir=config.fixtures_dir)
 
 SOURCES: dict[str, SourcePort] = {
@@ -147,6 +159,12 @@ SOURCES: dict[str, SourcePort] = {
     _munpia_com.key: _munpia_com,
     _blqiuge_cc.key: _blqiuge_cc,
     _pixiv_net.key: _pixiv_net,
+    _truyendichfull_site.key: _truyendichfull_site,
+    _royalroad_com.key: _royalroad_com,
+    _novema_jp.key: _novema_jp,
+    _sfacg_com.key: _sfacg_com,
+    _fanqie_com.key: _fanqie_com,
+    _qdmm_com.key: _qdmm_com,
 }
 # Nguồn demo đọc file trên đĩa — chỉ đăng ký khi bật CRAWL_ENABLE_DEMO_SOURCE
 # (test/dev). Tắt thì dry-run / thêm truyện với source_key=demo_local 404.
@@ -830,7 +848,11 @@ for _key, _label, _slug, _enabled in _TRUYENFULL_CATEGORIES:
             "source_key": "dtruyen_com",
             "genre_key": _key,
             "label": _label,
-            "list_url": f"https://dtruyen.com/the-loai/{_slug}/",
+            "list_url": (
+                "https://truyencom.com/truyen-hot/"
+                if _slug == "truyen-hot"
+                else f"https://truyencom.com/truyen-{_slug}/full/"
+            ),
             "enabled": _enabled,
         }
     )
@@ -841,7 +863,11 @@ for _key, _label, _slug, _enabled in _TRUYENFULL_CATEGORIES:
             "source_key": "sstruyen_net",
             "genre_key": _key,
             "label": _label,
-            "list_url": f"https://sstruyen.net/the-loai/{_slug}/",
+            "list_url": (
+                "https://sstruyen.net/truyen-hot"
+                if _slug == "truyen-hot"
+                else f"https://sstruyen.net/the-loai/{_slug}/"
+            ),
             "enabled": _enabled,
         }
     )
@@ -1163,6 +1189,98 @@ for _key, _label, _tag, _enabled in _PIXIV_TAGS:
             "enabled": _enabled,
         }
     )
+
+# --- TruyenDichFull (thay MeTruyenCV đã đóng) ---
+_TDF_CATEGORIES = [
+    ("fantasy", "Huyền huyễn (Tiên hiệp)", "tien-hiep", True),
+    ("other", "Khác (Huyền huyễn)", "huyen-huyen", False),
+    ("romance", "Ngôn tình (Ngôn tình)", "ngon-tinh", False),
+    ("urban", "Đô thị (Đô thị)", "đo-thi", False),
+    ("game", "Du hí/Game (Hệ thống)", "he-thong", False),
+]
+for _key, _label, _slug, _enabled in _TDF_CATEGORIES:
+    GENRE_SEEDS.append(
+        {
+            "source_key": "truyendichfull_site",
+            "genre_key": _key,
+            "label": _label,
+            "list_url": f"https://truyendichfull.site/the-loai/{_slug}",
+            "enabled": _enabled,
+        }
+    )
+
+# --- Royal Road (EN) ---
+_RR_LISTS = [
+    ("other", "Khác (Best Rated)", "https://www.royalroad.com/fictions/best-rated", True),
+    ("other_complete", "Khác (Complete)", "https://www.royalroad.com/fictions/complete", False),
+    ("other_trending", "Khác (Trending)", "https://www.royalroad.com/fictions/trending", False),
+    ("other_weekly", "Khác (Popular this week)", "https://www.royalroad.com/fictions/weekly-popular", False),
+]
+for _key, _label, _url, _enabled in _RR_LISTS:
+    GENRE_SEEDS.append(
+        {
+            "source_key": "royalroad_com",
+            "genre_key": _key,
+            "label": _label,
+            "list_url": _url,
+            "enabled": _enabled,
+        }
+    )
+
+# --- Novema (JP) ---
+_NOVEMA_RANKS = [
+    ("other", "Khác (総合ランキング)", "https://novema.jp/ranking", True),
+    ("romance", "Ngôn tình (恋愛)", "https://novema.jp/love/ranking", False),
+    ("other_youth", "Khác (青春)", "https://novema.jp/youth/ranking", False),
+    ("fanfic", "Đồng nhân (BL)", "https://novema.jp/bl/ranking", False),
+]
+for _key, _label, _url, _enabled in _NOVEMA_RANKS:
+    GENRE_SEEDS.append(
+        {
+            "source_key": "novema_jp",
+            "genre_key": _key,
+            "label": _label,
+            "list_url": _url,
+            "enabled": _enabled,
+        }
+    )
+
+# --- SFACG ---
+GENRE_SEEDS.append(
+    {
+        "source_key": "sfacg_com",
+        "genre_key": "other",
+        "label": "Khác (排行榜)",
+        "list_url": "https://book.sfacg.com/Rank/",
+        "enabled": True,
+    }
+)
+
+# --- Fanqie library API (finished books) ---
+GENRE_SEEDS.append(
+    {
+        "source_key": "fanqie_com",
+        "genre_key": "other",
+        "label": "Khác (书库完结)",
+        "list_url": (
+            "https://fanqienovel.com/api/author/library/book_list/v0/"
+            "?page_count=20&page_index=0&gender=-1&category_id=-1"
+            "&creation_status=0&word_count=-1&book_type=-1&sort=0"
+        ),
+        "enabled": True,
+    }
+)
+
+# --- QDMM (起点女生) — cần cookie ---
+GENRE_SEEDS.append(
+    {
+        "source_key": "qdmm_com",
+        "genre_key": "romance",
+        "label": "Ngôn tình (女生频道)",
+        "list_url": "https://www.qdmm.com/all",
+        "enabled": True,
+    }
+)
 
 
 def catalog_genre_keys() -> set[tuple[str, str]]:

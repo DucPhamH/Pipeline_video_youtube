@@ -14,7 +14,7 @@ export type LifecycleStatus =
 
 export type SiteAccessKind = "free" | "session_optional" | "session_required"
 
-export type SiteRegion = "china" | "japan" | "korea" | "vietnam" | "taiwan"
+export type SiteRegion = "china" | "japan" | "korea" | "vietnam" | "taiwan" | "english"
 
 export interface Site {
   key: string

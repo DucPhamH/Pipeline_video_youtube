@@ -229,6 +229,7 @@ export const zh: MessageTree = {
     korea: "韩国",
     vietnam: "越南",
     taiwan: "台湾",
+    english: "英文",
   },
   access: {
     all: "全部会话类型",

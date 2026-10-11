@@ -47,6 +47,7 @@ class SyosetuComSource(BaseHtmlSource):
                 request_delay_sec=1.0,
                 paginate_list_url=self._paginate_list_url,
                 novel_url_from_chapter=self._derive_novel_url,
+                mirror_hosts=["syosetu.com"],
             )
         )
 

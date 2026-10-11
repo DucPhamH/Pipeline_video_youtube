@@ -2,6 +2,7 @@
 Đây là nơi áp dụng trực tiếp các bài học rút từ lncrawl/novel-downloader
 (crawl-service.md mục 2)."""
 import re
+from collections import Counter
 from typing import Sequence
 from urllib.parse import urlparse
 
@@ -39,6 +40,8 @@ _FIRST_PERSON_BY_LOCALE: dict[str, tuple[str, ...]] = {
     "ja": ("私", "僕", "俺", "わたし", "あたし"),
     "ko": ("나", "저", "내가", "저는", "나는"),
     "vi": ("tôi", "mình", "tao", "tớ", "em"),
+    # EN đếm theo nguyên từ (xem first_person_stats) — "i" không khớp trong "his".
+    "en": ("i", "me", "my", "mine", "myself"),
 }
 _THIRD_PERSON_BY_LOCALE: dict[str, tuple[str, ...]] = {
     # CHỈ "他"/"她" — KHÔNG thêm "他们"/"她们" riêng (đã chứa tiền tố).
@@ -46,7 +49,9 @@ _THIRD_PERSON_BY_LOCALE: dict[str, tuple[str, ...]] = {
     "ja": ("彼", "彼女"),
     "ko": ("그", "그녀"),
     "vi": ("anh ấy", "cô ấy", "họ", "ông ấy", "bà ấy"),
+    "en": ("he", "him", "his", "himself", "she", "her", "hers", "herself"),
 }
+_EN_WORD_RE = re.compile(r"[a-z]+")
 _FIRST_PERSON_MARKER = "我"  # tương thích test/call cũ
 _THIRD_PERSON_MARKERS = ["他", "她"]
 FIRST_PERSON_RATIO_THRESHOLD = 0.6
@@ -70,6 +75,9 @@ COMPLETION_MARKERS_BY_LOCALE: dict[str, tuple[str, ...]] = {
     "ja": ("完結", "完結済", "連載終了", "終了"),
     "ko": ("완결", "완료", "完結"),
     "vi": ("Hoàn thành", "hoàn thành", "Full", "FULL", "Hết", "End"),
+    # Không dùng "Complete" đơn — RR hay ghi "[Book 1 Complete]" khi truyện vẫn ra.
+    # "COMPLETED" = nhãn trạng thái trên listing Royal Road (NovelRef.latest_chapter_title).
+    "en": ("COMPLETED", "Completed", "THE END", "The End", "Epilogue", "EPILOGUE"),
 }
 
 # Crawl linh hoạt — dùng chung mọi site (use_cases.py).
@@ -158,6 +166,8 @@ def _script_ratio(text: str, locale: str) -> float:
         if latin == 0:
             return 0.0
         return len(_VIETNAMESE_CHAR_RE.findall(text)) / latin
+    if locale == "en":
+        return sum(1 for c in text if c.isascii() and c.isalpha()) / len(text)
     return len(_CHINESE_CHAR_RE.findall(text)) / len(text)
 
 
@@ -175,7 +185,7 @@ def validate_chapter_content(text: str, *, locale: str = "zh") -> tuple[bool, st
     ratio = _script_ratio(text, locale)
     min_ratio = MIN_CHINESE_RATIO if locale == "zh" else MIN_SCRIPT_RATIO
     if ratio < min_ratio:
-        label = {"zh": "Hán", "ja": "Nhật", "ko": "Hàn", "vi": "Việt"}.get(locale, locale)
+        label = {"zh": "Hán", "ja": "Nhật", "ko": "Hàn", "vi": "Việt", "en": "Anh"}.get(locale, locale)
         return False, f"Tỉ lệ ký tự {label} quá thấp ({ratio:.0%}) — nội dung có thể không đúng"
 
     return True, None
@@ -186,14 +196,17 @@ def is_completed(
     *,
     locale: str = "zh",
     total_chapters: int | None = None,
+    listing_hint: str = "",
 ) -> bool:
+    """`listing_hint` = NovelRef.latest_chapter_title từ trang danh sách (chương
+    mới nhất hoặc nhãn trạng thái site, vd "COMPLETED" của Royal Road)."""
     # 短編 / one-shot: chỉ JA/KO thường 1 chương không gắn 完結 — coi đã xong.
     # Không áp dụng cho zh (1 chương có thể là TOC lỗi / stub dài).
     if total_chapters == 1 and locale in ("ja", "ko"):
         return True
     markers = COMPLETION_MARKERS_BY_LOCALE.get(locale, COMPLETION_MARKERS)
-    title = latest_chapter_title or ""
-    return any(marker in title for marker in markers)
+    texts = (latest_chapter_title or "", listing_hint or "")
+    return any(marker in text for marker in markers for text in texts)
 
 
 def is_short_enough(total_chapters: int, max_chapters_per_story: int) -> bool:
@@ -215,6 +228,10 @@ def first_person_stats(text: str, *, locale: str = "zh") -> tuple[float, int]:
     if locale == "vi":
         first = sum(haystack.count(m.lower()) for m in first_markers)
         third = sum(haystack.count(m.lower()) for m in third_markers)
+    elif locale == "en":
+        words = Counter(_EN_WORD_RE.findall(text.lower()))
+        first = sum(words[m] for m in first_markers)
+        third = sum(words[m] for m in third_markers)
     else:
         first = sum(text.count(m) for m in first_markers)
         third = sum(text.count(m) for m in third_markers)
@@ -274,11 +291,15 @@ def matches_completion_filter(
     *,
     locale: str = "zh",
     total_chapters: int | None = None,
+    listing_hint: str = "",
 ) -> bool:
     """Giá trị lạ (không nằm trong COMPLETION_FILTERS) coi như "any" —
     không lọc, an toàn hơn là chặn nhầm."""
     completed = is_completed(
-        latest_chapter_title, locale=locale, total_chapters=total_chapters
+        latest_chapter_title,
+        locale=locale,
+        total_chapters=total_chapters,
+        listing_hint=listing_hint,
     )
     if completion_filter == "completed_only":
         return completed
@@ -293,6 +314,7 @@ def evaluate_candidate(
     completion_filter: CompletionFilter = "completed_only",
     *,
     locale: str = "zh",
+    listing_hint: str = "",
 ) -> tuple[bool, str]:
     """Tiêu chí 'ngắn + [lọc hoàn thành tuỳ chọn]' (crawl-service.md mục 7),
     đánh giá trên chính danh sách chương đã fetch được. Trả (được nhận?, lý
@@ -314,6 +336,7 @@ def evaluate_candidate(
         completion_filter,
         locale=locale,
         total_chapters=total_chapters,
+        listing_hint=listing_hint,
     ):
         label = {"completed_only": "đã hoàn thành", "ongoing_only": "đang ra (chưa hoàn thành)"}.get(
             completion_filter, completion_filter

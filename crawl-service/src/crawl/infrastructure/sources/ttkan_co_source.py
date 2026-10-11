@@ -10,18 +10,24 @@ import json
 import re
 import time
 
-import httpx
+from bs4 import BeautifulSoup
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from crawl.domain.ports import ScrapeError
 from crawl.domain.value_objects import ChapterRef, NovelRef
-from crawl.infrastructure.sources.base_html_source import BaseHtmlSource, SourceConfig
+from crawl.infrastructure.sources.base_browser_source import BaseBrowserSource
+from crawl.infrastructure.sources.base_html_source import SourceConfig
+from crawl.infrastructure.sources.browser_fetch import browser_get_html
 
 _NOVEL_ID = re.compile(r"/novel/chapters/([a-z0-9\-]+)", re.I)
 _PAGEA = re.compile(r"/novel/pagea/([a-z0-9\-]+)_(\d+)\.html", re.I)
 
 
-class TtkanCoSource(BaseHtmlSource):
+class TtkanCoSource(BaseBrowserSource):
+    # Trang HTML có JS "正在验证浏览器": httpx và TLS đều 403 → vào thẳng browser.
+    prefer_tls_first = False
+    browser_wait_selector = ".novel_cell, .content"
+
     def __init__(self) -> None:
         super().__init__(
             SourceConfig(
@@ -100,31 +106,25 @@ class TtkanCoSource(BaseHtmlSource):
             reraise=True,
             stop=stop_after_attempt(self.cfg.max_retries + 1),
             wait=wait_exponential(multiplier=self.cfg.backoff_base_sec, min=1, max=30),
-            retry=retry_if_exception_type((httpx.HTTPError, ScrapeError)),
+            retry=retry_if_exception_type(ScrapeError),
         )
         def _fetch() -> dict:
-            headers = {
-                "Referer": novel_url if novel_url.startswith("http") else self.cfg.base_url,
-                "Accept": "application/json",
-                "Accept-Language": self.cfg.accept_language or "zh-TW",
-            }
-            if getattr(self, "_session_cookie_header", ""):
-                headers["Cookie"] = self._session_cookie_header
-            resp = self._client.get(
-                f"{self.cfg.base_url}/api/nq/amp_novel_chapters",
-                params={"language": "tw", "novel_id": novel_id},
-                headers=headers,
+            # httpx/TLS bị 403 — Chromium trả JSON bọc trong <pre>.
+            html = browser_get_html(
+                f"{self.cfg.base_url}/api/nq/amp_novel_chapters?language=tw&novel_id={novel_id}",
+                cookie_header=getattr(self, "_session_cookie_header", "") or "",
+                wait_selector="pre",
+                proxy=self._proxy_url or None,
+                source_key=self.key,
             )
-            if resp.status_code != 200:
-                raise ScrapeError(f"[{self.key}] HTTP {resp.status_code} khi lấy mục lục {novel_id}")
             try:
-                return resp.json()
+                return json.loads(BeautifulSoup(html, "lxml").get_text())
             except json.JSONDecodeError as exc:
                 raise ScrapeError(f"[{self.key}] JSON mục lục không hợp lệ") from exc
 
         try:
             data = _fetch()
-        except (httpx.HTTPError, ScrapeError) as exc:
+        except ScrapeError as exc:
             raise ScrapeError(
                 f"[{self.key}] Không lấy được mục lục {novel_id}: {exc}"
             ) from exc

@@ -141,6 +141,39 @@ export const SESSION_GUIDES: Record<string, SessionGuide> = {
     ],
   },
 
+  qdmm_com: {
+    summary:
+      "Cùng hệ Yuewen với Qidian — anti-bot chặn cả trang list nếu thiếu cookie (ywguid). Chương VIP cần account đã mua.",
+    loginUrl: "https://passport.qidian.com/",
+    domainNote: "Cookie lấy từ www.qdmm.com sau khi đăng nhập passport Yuewen/Qidian.",
+    worksWithoutSession: ["Hiếm khi — anti-bot thường chặn ngay cả trang list."],
+    needsSession: [
+      {
+        task: "Quét thể loại",
+        level: "required",
+        detail: "Trang /all trả trang anti-bot nếu thiếu cookie.",
+      },
+      {
+        task: "Đọc chương free",
+        level: "required",
+        detail: "Playwright + cookie mới ổn định.",
+      },
+      {
+        task: "Chương VIP",
+        level: "required",
+        detail: "Cookie có quyền đọc trên account đã mua.",
+      },
+    ],
+    keyCookies: [
+      { name: "ywguid", note: "Bắt buộc để qua anti-bot" },
+      { name: "ywkey", note: "Thường đi kèm ywguid" },
+    ],
+    copyMethods: [...COMMON_COPY_METHODS],
+    extraNotes: [
+      "Đăng nhập xong mở https://www.qdmm.com → F5 → copy Cookie từ Network.",
+    ],
+  },
+
   ciweimao_com: {
     summary:
       "Xem list thể loại thường không cần login; đọc chương hay bị CAPTCHA/API lỗi nếu thiếu cookie. VIP ảnh cần account + OCR.",

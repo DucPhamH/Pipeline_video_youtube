@@ -31,7 +31,11 @@ from crawl.infrastructure.sources.fetch_guard import (
     assert_public_url,
     url_belongs_to_source,
 )
-from crawl.infrastructure.sources.proxy_pool import get_a_proxy, httpx_proxy_mounts
+from crawl.infrastructure.sources.proxy_pool import (
+    LocalDnsSocksTransport,
+    get_a_proxy,
+    httpx_proxy_mounts,
+)
 from crawl.infrastructure.sources.text_decode import charset_from_content_type, decode_html_bytes
 from crawl.infrastructure.sources.tls_fetch import looks_like_cloudflare_challenge
 
@@ -185,7 +189,7 @@ class BaseHtmlSource:
         """Event hook httpx — chạy cho MỌI request kể cả từng bước redirect:
         chặn host private (SSRF) và bỏ Cookie phiên nếu host không thuộc site."""
         url = str(request.url)
-        assert_public_url(url)
+        assert_public_url(url, proxy=self._proxy_url)
         if "cookie" in request.headers and not url_belongs_to_source(url, self):
             del request.headers["cookie"]
 
@@ -198,6 +202,8 @@ class BaseHtmlSource:
         }
         if not proxy:
             return httpx.Client(**kwargs)
+        if proxy.startswith("socks5://"):
+            return httpx.Client(transport=LocalDnsSocksTransport(proxy=proxy), **kwargs)
         # httpx: ưu tiên `proxy=` (0.28+); 0.27 vẫn nhận `proxies=`.
         try:
             return httpx.Client(proxy=httpx_proxy_mounts(proxy), **kwargs)
@@ -275,7 +281,7 @@ class BaseHtmlSource:
         (không kiểm marker VIP — dễ false positive)."""
         from platform_.run_cancel import interruptible_sleep
 
-        assert_public_url(url)
+        assert_public_url(url, proxy=self._proxy_url)
         self._apply_user_session()
         retry_after_budget = {"left": _MAX_TOTAL_RETRY_AFTER_SEC}
 

@@ -22,7 +22,9 @@ class TruyenfullFamilySource(BaseHtmlSource):
 
     use_ajax_chapter_list = False
 
-    def __init__(self, *, key: str, name: str, base_url: str) -> None:
+    def __init__(
+        self, *, key: str, name: str, base_url: str, mirror_hosts: list[str] | None = None
+    ) -> None:
         host = base_url.rstrip("/").split("//", 1)[-1]
         super().__init__(
             SourceConfig(
@@ -50,6 +52,7 @@ class TruyenfullFamilySource(BaseHtmlSource):
                 request_delay_sec=1.0,
                 paginate_list_url=self._paginate_list_url,
                 novel_url_from_chapter=self._derive_novel_url,
+                mirror_hosts=list(mirror_hosts or []),
             )
         )
 

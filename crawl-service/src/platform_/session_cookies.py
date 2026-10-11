@@ -23,6 +23,7 @@ SESSION_COOKIE_SETTING = "session_cookie"
 REQUIRED_SESSION_COOKIES: dict[str, tuple[str, ...]] = {
     "zhihu_com": ("z_c0", "d_c0"),
     "qidian_com": ("ywguid",),
+    "qdmm_com": ("ywguid",),
 }
 
 

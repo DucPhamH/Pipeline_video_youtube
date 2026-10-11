@@ -1,6 +1,8 @@
-"""Adapter dtruyen.com / dtruyen.net — CMS gần TruyenFull; cần CRAWL_PROXY_VN.
+"""Adapter dtruyen.com (301 → truyencom.com) — CMS gần TruyenFull; cần CRAWL_PROXY_VN.
 
-Selectors theo @duyquangnvx/webnovel-scraper (dtruyen config).
+Selectors theo @duyquangnvx/webnovel-scraper (dtruyen config), vẫn khớp truyencom.
+URL chương `/slug/chuong-N.html` thiếu id truyện (`/slug.66/`) nên không suy
+ra được URL mục lục từ URL chương.
 """
 import re
 
@@ -16,8 +18,8 @@ class DtruyenComSource(BaseHtmlSource):
         super().__init__(
             SourceConfig(
                 key="dtruyen_com",
-                name="DTruyen (dtruyen.com · cần proxy VN)",
-                base_url="https://dtruyen.com",
+                name="DTruyen (truyencom.com · cần proxy VN)",
+                base_url="https://truyencom.com",
                 content_locale="vi",
                 accept_language="vi,en;q=0.8",
                 genre_item_selector=".list-truyen .row, .list-truyen .row[itemtype]",
@@ -28,17 +30,12 @@ class DtruyenComSource(BaseHtmlSource):
                 novel_title_selector="h1.title, h3.title",
                 novel_author_selector='.info a[itemprop="author"]',
                 novel_cover_selector='[itemprop="image"]',
-                strip_lines_containing=["dtruyen", "quảng cáo", "bình luận"],
+                strip_lines_containing=["dtruyen", "truyencom", "quảng cáo", "bình luận"],
                 request_delay_sec=1.0,
                 paginate_list_url=self._paginate_list_url,
-                novel_url_from_chapter=self._derive_novel_url,
+                mirror_hosts=["wetruyen.com", "dtruyen.com"],
             )
         )
-
-    @staticmethod
-    def _derive_novel_url(chapter_url: str) -> str | None:
-        m = re.match(r"^(https?://[^/]+/[^/]+/)chuong-\d+", chapter_url, re.I)
-        return m.group(1) if m else None
 
     @staticmethod
     def _paginate_list_url(url: str, page: int) -> str:

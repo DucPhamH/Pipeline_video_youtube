@@ -28,7 +28,7 @@ _EPISODE_HREF = re.compile(r"/novel/(\d+)/(\d+)/episode/(\d+)/?$")
 
 class AlphapolisCoJpSource(BaseBrowserSource):
     browser_wait_selector = (
-        "section.p-content.is-novel, .p-table-of-contents__episode-link, "
+        "section.c-content, .p-table-of-contents__episode-link, "
         "#novelBody, h1.p-content-info__title"
     )
     prefer_tls_first = False  # đã verify curl_cffi/TLS impersonate KHÔNG qua được AWS WAF — vào thẳng browser
@@ -41,8 +41,8 @@ class AlphapolisCoJpSource(BaseBrowserSource):
                 base_url="https://www.alphapolis.co.jp",
                 content_locale="ja",
                 accept_language="ja,en;q=0.8",
-                genre_item_selector="section.p-content.is-novel",
-                genre_title_selector="h2.p-content__title a",
+                genre_item_selector="section.c-content",
+                genre_title_selector="h2.c-content__title a",
                 content_selector="#novelBody",
                 novel_title_selector="h1.p-content-info__title",
                 strip_lines_containing=["アルファポリス", "alphapolis.co.jp"],

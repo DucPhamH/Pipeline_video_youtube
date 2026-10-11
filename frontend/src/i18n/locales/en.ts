@@ -229,6 +229,7 @@ export const en: MessageTree = {
     korea: "Korea",
     vietnam: "Vietnam",
     taiwan: "Taiwan",
+    english: "English",
   },
   access: {
     all: "All session types",

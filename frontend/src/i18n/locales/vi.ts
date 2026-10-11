@@ -230,6 +230,7 @@ export const vi: MessageTree = {
     korea: "Hàn Quốc",
     vietnam: "Việt Nam",
     taiwan: "Đài Loan",
+    english: "Tiếng Anh",
   },
   access: {
     all: "Mọi loại phiên",

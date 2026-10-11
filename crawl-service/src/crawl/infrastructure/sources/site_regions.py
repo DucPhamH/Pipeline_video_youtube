@@ -1,7 +1,7 @@
 """Vùng/ngôn ngữ nguồn — filter tab trang Danh sách site."""
 from typing import Literal
 
-SiteRegion = Literal["china", "japan", "korea", "vietnam", "taiwan"]
+SiteRegion = Literal["china", "japan", "korea", "vietnam", "taiwan", "english"]
 
 # Site không liệt kê → `china` (clone biquge tiếng Trung).
 _SITE_REGION: dict[str, SiteRegion] = {
@@ -13,6 +13,7 @@ _SITE_REGION: dict[str, SiteRegion] = {
     "daysneo_com": "japan",
     "alphapolis_co_jp": "japan",
     "pixiv_net": "japan",
+    "novema_jp": "japan",
     "novelpia_com": "korea",
     "munpia_com": "korea",
     "truyenfull_vn": "vietnam",
@@ -20,11 +21,16 @@ _SITE_REGION: dict[str, SiteRegion] = {
     "dtruyen_com": "vietnam",
     "sstruyen_net": "vietnam",
     "docln_net": "vietnam",
+    "truyendichfull_site": "vietnam",
     "esjzone_cc": "taiwan",
     "ixdzs_tw": "taiwan",
     "ttkan_co": "taiwan",
     "quanben_io": "taiwan",
     "zhihu_com": "china",
+    "fanqie_com": "china",
+    "sfacg_com": "china",
+    "qdmm_com": "china",
+    "royalroad_com": "english",
 }
 
 

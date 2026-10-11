@@ -58,3 +58,18 @@ def test_zhihu_session_requires_z_c0_and_d_c0(client):
     probe = client.post("/api/crawl/sites/zhihu_com/session/probe").json()
     # Có đủ tên cookie thì probe mới đi mạng (có thể fail mạng) — không còn báo thiếu d_c0
     assert "d_c0" not in (probe.get("missing_required_cookies") or [])
+
+
+def test_qdmm_session_requires_ywguid(client):
+    incomplete = client.put(
+        "/api/crawl/sites/qdmm_com/session",
+        json={"cookie_header": "ywkey=abc"},
+    ).json()
+    assert incomplete["configured"] is False
+    assert incomplete["missing_required_cookies"] == ["ywguid"]
+
+    complete = client.put(
+        "/api/crawl/sites/qdmm_com/session",
+        json={"cookie_header": "ywguid=123; ywkey=abc"},
+    ).json()
+    assert complete["configured"] is True
